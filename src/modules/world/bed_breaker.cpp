@@ -10,6 +10,8 @@
 #include "minecraft/game_helpers.hpp"
 #include "minecraft/mc_wrappers.hpp"
 #include "util/math.hpp"
+#include "events/module_manager.hpp"
+#include "modules/world/fast_mine_core.hpp"
 #include "util/random.hpp"
 
 // Bed Breaker (legit only) - works like a player with a mouse, same scheme as Bridge:
@@ -39,6 +41,8 @@ constexpr int32_t kFaceEast  = 5;
 constexpr uint32_t kAimPriority         = 800u; // yields to Bridge / Clutch (1000)
 constexpr int32_t  kRescanIntervalTicks = 5;    // throttle for the block scan while no bed is found
 constexpr int32_t  kMaxBedCandidates    = 8;
+constexpr int32_t  kLockMissTicks       = 12;   // crosshair off the locked block this long -> pick a new block
+constexpr int32_t  kSwitchBackGraceTicks = 10;  // target lost this long before the tool is switched back
 
 void on_game_tick(void* event) noexcept;
 void on_module_state_changed(void* event) noexcept;
@@ -59,6 +63,14 @@ struct BedBreakerState {
     config::BoolSetting swap_tool{{}, "Swap tool", true, true, {}};
     config::BoolSetting switch_back{{}, "Switch back", true, true, {}};
 
+    // Built-in Fast Mine (same algorithm and ranges as the Fast Mine module), applied only to the blocks Bed
+    // Breaker itself is breaking (the bed and its cover blocks), independent of the Fast Mine module.
+    config::BoolSetting fast_mine{{}, "Fast mine", true, true, {}};
+    config::FloatSetting fm_speed{{}, "Speed", "%.2fx", 0.01f, 0.0f, 1.0f, 2.0f, 1.0f, 1.0f};
+    config::FloatSetting fm_break_delay{{}, "Break delay", "%.0f ms", 1.0f, 50.0f, 0.0f, 5.0f, 5.0f, 5.0f};
+    config::BoolSetting fm_decr_block_hit_delay{{}, "Always decrease break delay", false, false, {}};
+    fast_mine_core::State fm_core{};
+
     // Target (owned by on_post_living_update, read by on_game_tick)
     bool has_bed = false;
     mc::Vec3i bed{0, 0, 0};          // targeted bed half
@@ -69,6 +81,16 @@ struct BedBreakerState {
     bool aim_active = false;         // aimed this tick -> clicking allowed
     bool spoof_rotation_active = false;
     int32_t rescan_cooldown = 0;
+
+    // Mining lock: once a block is being mined it stays the target (fixed aim point, no re-evaluation, no
+    // jitter) until it is broken, out of reach or off the crosshair for kLockMissTicks. Without this the target
+    // face / cover block was re-picked every tick and the crosshair hopped between blocks, restarting progress.
+    bool locked = false;
+    mc::Vec3i locked_block{0, 0, 0};
+    int32_t locked_id = -1;
+    math::Vec3d locked_aim{0.0, 0.0, 0.0};
+    int32_t lock_miss_ticks = 0;
+    int32_t lost_ticks = 0;          // ticks without any target (tool switch-back grace)
 
     // Side effects we own and must undo
     bool attack_overridden = false;
@@ -115,10 +137,17 @@ bool is_same_bed(const mc::Vec3i& pos, const mc::Vec3i& bed) noexcept {
     return pos.y == bed.y && (std::abs(pos.x - bed.x) + std::abs(pos.z - bed.z)) <= 1;
 }
 
+void unlock_target() noexcept {
+    g_bed_breaker.locked = false;
+    g_bed_breaker.locked_id = -1;
+    g_bed_breaker.lock_miss_ticks = 0;
+}
+
 void clear_target() noexcept {
     g_bed_breaker.has_bed = false;
     g_bed_breaker.face = -1;
     g_bed_breaker.mine_is_cover = false;
+    unlock_target();
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -400,12 +429,26 @@ int32_t scan_beds(events::GameContext* ctx, const math::Vec3d& eye, mc::Vec3i* o
 // Events
 // ---------------------------------------------------------------------------------------------
 
+fast_mine_core::Params fast_mine_params() noexcept {
+    return {g_bed_breaker.fm_speed.value, g_bed_breaker.fm_break_delay.value,
+            g_bed_breaker.fm_decr_block_hit_delay.value};
+}
+
 // Target upkeep + mouse-style silent aim (runs after the player update, like Bridge).
 void on_post_living_update(void* event) noexcept {
+    events::GameContext* ctx = static_cast<events::ContextEvent*>(event)->ctx;
+
+    // Built-in Fast Mine: vanilla just advanced the progress of the block we mined this tick (if any).
+    // post_living() only acts when on_game_tick armed it for an eligible block this tick.
+    if (g_bed_breaker.fast_mine.value) {
+        jobject controller = mc::mc_get_player_controller(ctx->jni, ctx->minecraft);
+        if (controller != nullptr) {
+            fast_mine_core::post_living(ctx->jni, controller, fast_mine_params(), g_bed_breaker.fm_core);
+        }
+    }
+
     g_bed_breaker.aim_active = false;
     g_bed_breaker.spoof_rotation_active = false;
-
-    events::GameContext* ctx = static_cast<events::ContextEvent*>(event)->ctx;
     if (!ctx->in_game_focus) {
         clear_target();
         restore_tool(ctx);
@@ -421,11 +464,24 @@ void on_post_living_update(void* event) noexcept {
     const math::Vec2f cur_rot =
         math::vec2_add(mc::entity_get_rotation(jni, player), mc::get_pending_aim_rotation_delta());
 
-    // Keep the current bed while it still exists and has a hittable face.
+    // Mining lock: keep the block that is being mined until it is gone (broken -> id changes) or out of reach.
+    if (g_bed_breaker.locked) {
+        const mc::Vec3i& lb = g_bed_breaker.locked_block;
+        const double range = static_cast<double>(g_bed_breaker.range.value);
+        if (!g_bed_breaker.has_bed || block_id_at(jni, ctx->world, lb.x, lb.y, lb.z) != g_bed_breaker.locked_id ||
+            math::vec3_dist_sq(eye, g_bed_breaker.locked_aim) > range * range) {
+            unlock_target();
+        }
+    }
+
     FaceChoice choice{};
     bool have = false;
-    if (g_bed_breaker.has_bed &&
-        block_id_at(jni, ctx->world, g_bed_breaker.bed.x, g_bed_breaker.bed.y, g_bed_breaker.bed.z) == kBlockBed) {
+    if (g_bed_breaker.locked) {
+        have = true; // keep target, face, cover block and aim point exactly as they are
+    } else if (g_bed_breaker.has_bed &&
+               block_id_at(jni, ctx->world, g_bed_breaker.bed.x, g_bed_breaker.bed.y, g_bed_breaker.bed.z) ==
+                   kBlockBed) {
+        // Keep the current bed while it still exists and has a hittable face.
         have = evaluate_bed(ctx, eye, cur_rot, g_bed_breaker.bed, g_bed_breaker.face, &choice);
     }
 
@@ -450,14 +506,22 @@ void on_post_living_update(void* event) noexcept {
     }
 
     if (!have) {
-        restore_tool(ctx); // done (or nothing to do): switch back
+        // Done (or nothing to do): switch back - after a short grace so a one-tick gap does not flip the slot.
+        if (++g_bed_breaker.lost_ticks > kSwitchBackGraceTicks) {
+            restore_tool(ctx);
+        }
         return;
     }
+    g_bed_breaker.lost_ticks = 0;
 
-    g_bed_breaker.face = choice.face;
-    g_bed_breaker.mine_is_cover = choice.cover;
-    g_bed_breaker.mine_target = choice.mine;
-    g_bed_breaker.aim_point = choice.aim;
+    if (g_bed_breaker.locked) {
+        g_bed_breaker.aim_point = g_bed_breaker.locked_aim; // fixed point on the block being mined
+    } else {
+        g_bed_breaker.face = choice.face;
+        g_bed_breaker.mine_is_cover = choice.cover;
+        g_bed_breaker.mine_target = choice.mine;
+        g_bed_breaker.aim_point = choice.aim;
+    }
 
     // A higher-priority aim owner (Bridge, Clutch, ...) is active: don't fight it this tick.
     if (!mc::try_claim_aim_priority(kAimPriority)) {
@@ -488,6 +552,7 @@ void on_post_living_update(void* event) noexcept {
 // release happens before vanilla mines, nothing behind/under the bed is ever touched.
 void on_game_tick(void* event) noexcept {
     events::GameContext* ctx = static_cast<events::ContextEvent*>(event)->ctx;
+    fast_mine_core::skip_tick(g_bed_breaker.fm_core); // armed again below only while mining the bed / cover
     if (!ctx->in_game_focus || !g_bed_breaker.aim_active) {
         release_attack(ctx);
         return;
@@ -504,16 +569,49 @@ void on_game_tick(void* event) noexcept {
     jobject block = mc::world_get_block(jni, ctx->world, hit.x, hit.y, hit.z);
     const int32_t hit_id = (block != nullptr) ? mc::block_get_id(jni, block) : -1;
 
-    const bool on_bed = hit_id == kBlockBed && is_same_bed(hit, g_bed_breaker.bed);
-    const bool on_cover = g_bed_breaker.mine_is_cover && hit_id > 0 && same_pos(hit, g_bed_breaker.mine_target);
-    if (!on_bed && !on_cover) {
-        release_attack(ctx);
-        return;
+    if (g_bed_breaker.locked) {
+        // Only the locked block (or the other half of the same bed) may be mined until it is gone.
+        const bool on_locked = same_pos(hit, g_bed_breaker.locked_block) ||
+                               (g_bed_breaker.locked_id == kBlockBed && hit_id == kBlockBed &&
+                                is_same_bed(hit, g_bed_breaker.locked_block));
+        if (!on_locked) {
+            if (++g_bed_breaker.lock_miss_ticks > kLockMissTicks) {
+                unlock_target(); // something moved in the way: re-plan next tick
+            }
+            release_attack(ctx);
+            return;
+        }
+        g_bed_breaker.lock_miss_ticks = 0;
+    } else {
+        const bool on_bed = hit_id == kBlockBed && is_same_bed(hit, g_bed_breaker.bed);
+        const bool on_cover =
+            g_bed_breaker.mine_is_cover && hit_id > 0 && same_pos(hit, g_bed_breaker.mine_target);
+        if (!on_bed && !on_cover) {
+            release_attack(ctx);
+            return;
+        }
+        // Start mining this block: lock it and freeze the aim point until it is broken.
+        g_bed_breaker.locked = true;
+        g_bed_breaker.locked_block = hit;
+        g_bed_breaker.locked_id = hit_id;
+        g_bed_breaker.locked_aim = g_bed_breaker.aim_point;
+        g_bed_breaker.lock_miss_ticks = 0;
     }
 
     if (g_bed_breaker.swap_tool.value) {
         swap_to_best_tool(ctx, block);
     }
+
+    // Built-in Fast Mine for the bed / cover block (the Fast Mine module yields while we own the mining).
+    if (g_bed_breaker.fast_mine.value) {
+        jobject controller = mc::mc_get_player_controller(jni, ctx->minecraft);
+        if (controller == nullptr) {
+            fast_mine_core::reset(g_bed_breaker.fm_core);
+        } else {
+            fast_mine_core::pre_tick(jni, controller, fast_mine_params(), g_bed_breaker.fm_core);
+        }
+    }
+
     press_attack(ctx);
 }
 
@@ -535,6 +633,8 @@ void on_module_state_changed(void* event) noexcept {
     g_bed_breaker.attack_overridden = false;
     g_bed_breaker.saved_prev_slot = -1;
     g_bed_breaker.selected_tool_slot = -1;
+    g_bed_breaker.lost_ticks = 0;
+    fast_mine_core::reset(g_bed_breaker.fm_core);
 }
 
 // Silent rotation + WASD move-fix while aiming at a bed.
@@ -561,6 +661,14 @@ void render_settings(gui::ClickGui* gui, gui::GuiRenderer* renderer) noexcept {
     if (g_bed_breaker.swap_tool.value) {
         g_bed_breaker.switch_back.render(gui, renderer);
     }
+
+    gui::widgets::render_section_header(gui, renderer, "Fast mine");
+    g_bed_breaker.fast_mine.render(gui, renderer);
+    if (g_bed_breaker.fast_mine.value) {
+        g_bed_breaker.fm_speed.render(gui, renderer);
+        g_bed_breaker.fm_break_delay.render(gui, renderer);
+        g_bed_breaker.fm_decr_block_hit_delay.render(gui, renderer);
+    }
 }
 
 void visit_config(config::ConfigArchive* archive) noexcept {
@@ -571,12 +679,21 @@ void visit_config(config::ConfigArchive* archive) noexcept {
     g_bed_breaker.randomize.visit(archive, "randomize");
     g_bed_breaker.swap_tool.visit(archive, "swap_tool");
     g_bed_breaker.switch_back.visit(archive, "switch_back");
+    g_bed_breaker.fast_mine.visit(archive, "fast_mine");
+    g_bed_breaker.fm_speed.visit(archive, "fast_mine_speed");
+    g_bed_breaker.fm_break_delay.visit(archive, "fast_mine_break_delay");
+    g_bed_breaker.fm_decr_block_hit_delay.visit(archive, "fast_mine_decr_block_hit_delay");
 }
 
 } // namespace
 
 events::Module* get_bed_breaker_module() noexcept {
     return &g_bed_breaker.base;
+}
+
+bool bed_breaker_owns_fast_mine() noexcept {
+    return events::module_is_running(&g_bed_breaker.base) && g_bed_breaker.fast_mine.value &&
+           g_bed_breaker.aim_active;
 }
 
 } // namespace slinky::modules

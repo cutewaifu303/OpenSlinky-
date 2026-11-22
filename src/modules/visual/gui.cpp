@@ -5,9 +5,11 @@
 #include "commands/command_manager.hpp"
 #include "config/profile_manager.hpp"
 #include "config/settings.hpp"
+#include "events/module_manager.hpp"
 #include "gui/click_gui.hpp"
 #include "gui/widgets.hpp"
 #include "minecraft/mc_wrappers.hpp"
+#include "modules/adjust/clickgui/adjust_click_gui.hpp"
 #include "modules/module_interop.hpp"
 #include "util/keycodes.hpp"
 #include "util/time.hpp"
@@ -31,6 +33,16 @@ config::ModeSetting s_scale{
 
 config::ColorSetting s_accent_color{
     "Accent color", {0.953f, 0.365f, 0.071f}, {0.0f, 0.0f, 0.0f}
+};
+
+// OpenSlinky++ visual style (Slinky++ / Adjust). Picked with the switch in the bottom-right corner of the
+// ClickGUI, not listed in the GUI settings; stored in the global settings file (missing -> Slinky++).
+constexpr const char* kVisualStyleOptions[2] = {
+    "Slinky++",
+    "Adjust",
+};
+config::ModeSetting s_visual_style{
+    {}, "Visual style", 2, 0, kVisualStyleOptions, 0, 0, false
 };
 
 config::BoolSetting s_allow_input{{}, "Allow input while open", true, false};
@@ -64,12 +76,14 @@ void on_module_state_changed(void* raw_event) noexcept {
             minecraft::lwjgl_mouse_set_grabbed(ctx->jni, false);
         }
         s_click_gui.on_open(time::now_seconds());
+        adjust_clickgui::on_open(time::now_seconds()); // both menus, so a style switch while open just works
     } else {
         if (minecraft::mc_has_ingame_focus(ctx->jni, ctx->minecraft)) {
             minecraft::lwjgl_mouse_set_grabbed(ctx->jni, true);
         }
         s_click_gui.close_modal(time::now_seconds());
         s_click_gui.reset_interaction();
+        adjust_clickgui::on_close();
         if (!s_unloading) {
             const int err = config::save_global_settings(ctx->module_manager, ctx->profile_registry);
             if (err != 0) {
@@ -93,13 +107,24 @@ void on_gui_render_2d(void* raw_event) noexcept {
     auto* ev = static_cast<events::GuiRender2DEvent*>(raw_event);
     events::GameContext* ctx = ev->ctx;
 
-    s_click_gui.accent_color = nvgRGBf(
-        s_accent_color.value.r,
-        s_accent_color.value.g,
-        s_accent_color.value.b);
-    s_click_gui.hide_descriptions = s_compact.value;
-    s_click_gui.wide_layout = s_wide.value;
-    s_click_gui.render(ev->renderer, ctx->module_manager, ctx->profile_registry);
+    if (events::get_requested_visual_style() == events::VisualStyle::Adjust) {
+        // Adjust visual style: Adjust's ClickGUI (it closes itself with a fade, then asks to disable the GUI).
+        adjust_clickgui::render(ev);
+        if (adjust_clickgui::consume_close_request()) {
+            ctx->module_manager->request_set_enabled(get_gui_module(), false);
+        }
+    } else {
+        s_click_gui.accent_color = nvgRGBf(
+            s_accent_color.value.r,
+            s_accent_color.value.g,
+            s_accent_color.value.b);
+        s_click_gui.hide_descriptions = s_compact.value;
+        s_click_gui.wide_layout = s_wide.value;
+        s_click_gui.render(ev->renderer, ctx->module_manager, ctx->profile_registry);
+    }
+
+    // Mirror the style switch into the persisted setting (saved with the global settings when the GUI closes).
+    s_visual_style.value = static_cast<int32_t>(events::get_requested_visual_style());
 }
 
 // Matches sub_180053F20
@@ -124,6 +149,8 @@ void visit_config(config::ConfigArchive* ar) noexcept {
     s_allow_input.visit(ar, "allow_input");
     s_compact.visit(ar, "compact");
     s_wide.visit(ar, "wide");
+    s_visual_style.visit(ar, "visual_style");
+    events::request_visual_style(static_cast<events::VisualStyle>(s_visual_style.value));
 }
 
 events::Module create_module() noexcept {
@@ -178,19 +205,42 @@ bool gui_handle_window_input(
     events::ModuleManager* manager) noexcept
 {
     events::Module* gui_mod = get_gui_module();
-    if (gui_mod->enabled && s_click_gui.handle_input(event, time::now_seconds())) {
-        return true;
+    const bool adjust = events::get_requested_visual_style() == events::VisualStyle::Adjust;
+    if (gui_mod->enabled) {
+        const double now = time::now_seconds();
+        // The active menu gets the input; the other one only follows the mouse so a style switch is seamless.
+        if (adjust) {
+            if (event->kind == input::InputEventKind::MouseMove) {
+                s_click_gui.handle_input(event, now);
+            }
+            if (adjust_clickgui::handle_input(event, now)) {
+                return true;
+            }
+        } else {
+            if (event->kind == input::InputEventKind::MouseMove) {
+                adjust_clickgui::handle_input(event, now);
+            }
+            if (s_click_gui.handle_input(event, now)) {
+                return true;
+            }
+        }
     }
 
     if (event->kind == input::InputEventKind::KeyOrButton && event->pressed == 1) {
         const int32_t key_code = event->key.key_code;
         if (key_code != 0) {
             if (!was_already_down && key_code == gui_mod->keybind) {
-                manager->request_set_enabled(gui_mod, !gui_mod->enabled);
+                if (adjust && gui_mod->enabled) {
+                    adjust_clickgui::request_close(); // fade out; render() then disables the GUI module
+                } else {
+                    manager->request_set_enabled(gui_mod, !gui_mod->enabled);
+                }
                 return true;
             }
             if (gui_mod->enabled && key_code == input::KEY_ESC) {
-                manager->request_set_enabled(gui_mod, false);
+                if (!adjust) {
+                    manager->request_set_enabled(gui_mod, false);
+                }
                 return true;
             }
         }

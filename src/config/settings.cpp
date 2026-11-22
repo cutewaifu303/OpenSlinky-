@@ -6,6 +6,16 @@
 #include "config/profile_manager.hpp"
 #include "gui/widgets.hpp"
 
+#include "modules/adjust/hud/tabgui/setting_capture.hpp"
+
+// Adjust Tab GUI setting capture: while it runs, every setting reports itself instead of drawing
+// (see modules/adjust/hud/tabgui/setting_capture.hpp).
+namespace {
+namespace tg = ::slinky::modules::adjust_hud::tabgui;
+[[maybe_unused]] const bool kTabGuiCaptureHook = (tg::mark_capture_hook_installed(), true);
+} // namespace
+#define SLINKY_TABGUI_CAPTURE(kind)                                  do {                                                                 if (tg::capture_active()) {                                          tg::capture_item(tg::CaptureKind::kind, this);                   return;                                                      }                                                            } while (0)
+
 namespace slinky::config {
 
 math::Color3f parse_json_rgb(const cJSON* obj, const math::Color3f& fallback) noexcept {
@@ -62,6 +72,7 @@ void BoolSetting::visit(ConfigArchive* ar, const char* key) noexcept {
 }
 
 void BoolSetting::render(gui::ClickGui* gui, gui::GuiRenderer* renderer) noexcept {
+    SLINKY_TABGUI_CAPTURE(Bool);
     if (gui::widgets::render_bool_toggle(gui, renderer, label, &anim, &value)) {
         mark_profile_dirty(true);
     }
@@ -98,6 +109,7 @@ void FloatSetting::visit(ConfigArchive* ar, const char* key) noexcept {
 }
 
 void FloatSetting::render(gui::ClickGui* gui, gui::GuiRenderer* renderer) noexcept {
+    SLINKY_TABGUI_CAPTURE(Float);
     if (gui::widgets::render_float_slider(
             gui, renderer, label, format, &anim, min_val, max_val, step, display_scale, &value)) {
         mark_profile_dirty(true);
@@ -148,6 +160,7 @@ void RangeSetting::visit(ConfigArchive* ar, const char* key) noexcept {
 }
 
 void RangeSetting::render(gui::ClickGui* gui, gui::GuiRenderer* renderer) noexcept {
+    SLINKY_TABGUI_CAPTURE(Range);
     if (gui::widgets::render_range_slider(
             gui, renderer, label, single_format, range_format, &anim,
             min_val, max_val, step, display_scale, &value.min, &value.max)) {
@@ -193,6 +206,7 @@ void ModeSetting::visit(ConfigArchive* ar, const char* key) noexcept {
 }
 
 void ModeSetting::render(gui::ClickGui* gui, gui::GuiRenderer* renderer) noexcept {
+    SLINKY_TABGUI_CAPTURE(Mode);
     if (gui::widgets::render_mode_dropdown(
             gui, renderer, label, &anim, option_count, options, &value, nullable_zero)) {
         mark_profile_dirty(true);
@@ -236,6 +250,7 @@ void ColorSetting::visit(ConfigArchive* ar, const char* key) noexcept {
 }
 
 void ColorSetting::render(gui::ClickGui* gui, gui::GuiRenderer* renderer) noexcept {
+    SLINKY_TABGUI_CAPTURE(Color);
     if (gui::widgets::render_color_button(gui, renderer, label, &value)) {
         mark_profile_dirty(true);
     }
@@ -340,6 +355,7 @@ void DynamicListSetting::visit(ConfigArchive* ar, const char* key) noexcept {
 }
 
 void DynamicListSetting::render(gui::ClickGui* gui, gui::GuiRenderer* renderer) noexcept {
+    SLINKY_TABGUI_CAPTURE(DynamicList);
     const char* const* items = nullptr;
     size_t item_count = 0;
     if (get_picker_options != nullptr) {
@@ -357,13 +373,17 @@ bool deserialize_module_from_json(
     events::ModuleManager* mgr,
     events::Module* mod) noexcept
 {
-    cJSON* mod_obj = cJSON_GetObjectItemCaseSensitive(root, mod->name);
-    if ((mod->flags & events::kModuleFlagNoToggleSwitch) == 0) {
+    cJSON* mod_obj = cJSON_GetObjectItemCaseSensitive(root, events::module_config_key(mod));
+    // A module the config does not know at all (e.g. one added by OpenSlinky++ when loading an original Slinky
+    // config) keeps its default on/off state and keybind; its settings still load their defaults below.
+    // Configs written by Slinky/OpenSlinky++ always contain every module, so this only affects new modules.
+    const bool known_module = mod_obj != nullptr;
+    if (known_module && (mod->flags & events::kModuleFlagNoToggleSwitch) == 0) {
         const cJSON* on_item = cJSON_GetObjectItemCaseSensitive(mod_obj, "__on");
         const bool enable = cJSON_IsTrue(on_item) != 0;
         mgr->request_set_enabled(mod, enable);
     }
-    if ((mod->flags & events::kModuleFlagNoKeybind) == 0) {
+    if (known_module && (mod->flags & events::kModuleFlagNoKeybind) == 0) {
         uint32_t bind = 0;
         const cJSON* bind_item = cJSON_GetObjectItemCaseSensitive(mod_obj, "__bind");
         if (cJSON_IsNumber(bind_item)) {
@@ -389,7 +409,7 @@ bool deserialize_module_from_json(
 }
 
 bool serialize_module_to_json(cJSON* root, const events::Module* mod) noexcept {
-    cJSON* mod_obj = cJSON_AddObjectToObject(root, mod->name);
+    cJSON* mod_obj = cJSON_AddObjectToObject(root, events::module_config_key(mod));
     if (mod_obj == nullptr) {
         return false;
     }

@@ -55,3 +55,6 @@ __pycache__/
 .DS_Store
 Thumbs.db
 Desktop.ini
+
+# Local secrets (never committed): API keys compiled in obfuscated form
+src/secrets/

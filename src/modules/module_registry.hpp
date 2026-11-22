@@ -5,9 +5,9 @@
 
 namespace slinky::modules {
 
-inline constexpr size_t kModuleRegistryCount = 70;
+inline constexpr size_t kModuleRegistryCount = 97;
 
-// Returns the 70-element module registry in exact alphabetical order (matches off_18016BC90)
+// Returns the 97-element module registry in exact alphabetical order (matches off_18016BC90)
 events::Module* const* get_module_registry() noexcept;
 
 } // namespace slinky::modules

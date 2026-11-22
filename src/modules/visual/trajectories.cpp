@@ -365,6 +365,7 @@ events::Module create_module() noexcept {
     mod.events[events::kEventPostLivingUpdate] = {&on_post_living_update, 0};
     mod.render_settings = &render_settings;
     mod.visit_config = &visit_config;
+    mod.flags |= events::kModuleFlagStyleSlinky; // OpenSlinky++: Slinky++ visual style
     return mod;
 }
 

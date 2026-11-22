@@ -10,6 +10,8 @@
 #include "gui/widgets.hpp"
 #include "minecraft/game_helpers.hpp"
 #include "minecraft/mc_wrappers.hpp"
+#include "events/module_manager.hpp"
+#include "modules/adjust/render/esp/adjust_esp.hpp"
 #include "modules/module_interop.hpp"
 #include "util/containers.hpp"
 #include "util/math.hpp"
@@ -642,6 +644,7 @@ events::Module create_module() noexcept {
     mod.events[events::kEventPostLivingUpdate] = {&on_post_living_update, 0};
     mod.render_settings = &render_settings;
     mod.visit_config = &visit_config;
+    mod.flags |= events::kModuleFlagStyleSlinky; // OpenSlinky++: Slinky++ visual style
     return mod;
 }
 
@@ -652,9 +655,13 @@ bool nametags_can_render_vanilla_name(
     events::JniContext* jni,
     jobject renderer,
     jobject entity) noexcept {
-    if (get_name_tags_module()->enabled &&
+    if (events::module_is_running(get_name_tags_module()) &&
         minecraft::as_entity_player(jni, entity) != nullptr &&
         !minecraft::player_has_tag_flags(jni, entity, minecraft::kPlayerTagBot)) {
+        return false;
+    }
+    // Adjust ESP draws its own name tag for this entity.
+    if (adjust_esp_hides_vanilla_name(jni, entity)) {
         return false;
     }
     return minecraft::renderer_living_can_render_name(jni, renderer, entity);

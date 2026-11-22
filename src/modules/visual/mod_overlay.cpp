@@ -91,6 +91,9 @@ bool passes_module_filter(const events::Module* mod) noexcept {
     if ((mod->flags & events::kModuleFlagHiddenFromHud) != 0) {
         return false;
     }
+    if (!events::module_matches_style(mod, events::get_active_visual_style())) {
+        return false; // Adjust-style modules are not part of the Slinky++ list
+    }
     if (s_require_bound.value && mod->keybind == 0) {
         return false;
     }
@@ -432,6 +435,7 @@ events::Module create_module() noexcept {
     mod.events[events::kEventModuleKeybindChanged] = {&on_module_keybind_changed, 0};
     mod.render_settings = &render_settings;
     mod.visit_config = &visit_config;
+    mod.flags |= events::kModuleFlagStyleSlinky; // OpenSlinky++: Slinky++ visual style
     return mod;
 }
 

@@ -82,6 +82,7 @@ events::Module create_module() noexcept {
     mod.events[events::kEventRotationSpoofQuery] = {&on_rotation_spoof_query, -1000};
     mod.render_settings = &render_settings;
     mod.visit_config = &visit_config;
+    mod.flags |= events::kModuleFlagStyleSlinky; // OpenSlinky++: Slinky++ visual style
     return mod;
 }
 

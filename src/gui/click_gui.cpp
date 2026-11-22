@@ -10,6 +10,7 @@
 #include "config/profile_manager.hpp"
 #include "core/branding.hpp"
 #include "events/events.hpp"
+#include "events/module_manager.hpp"
 #include "util/keycodes.hpp"
 
 namespace slinky::gui {
@@ -350,10 +351,11 @@ void render_category_cards(
         renderer->logical_width,
         renderer->logical_height);
 
+    const events::VisualStyle style = events::get_requested_visual_style();
     for (size_t i = 0; i < span.count; ++i) {
         events::Module* mod = span.data[i];
-        if (mod == nullptr) {
-            continue;
+        if (mod == nullptr || !events::module_matches_style(mod, style)) {
+            continue; // modules of the other visual style are not listed
         }
 
         const math::Vec4f card_rect = gui->next_cell(mod->card_height_anim);
@@ -1045,6 +1047,56 @@ void ClickGui::show_tooltip(const char* text, float x, float y) noexcept {
     tooltip_pos = math::make_vec2(x, y);
 }
 
+// OpenSlinky++: tiny "Slinky++ | Adjust" visual-style switch in the bottom-right corner (screen space).
+void render_visual_style_switch(ClickGui* gui, GuiRenderer* renderer) noexcept {
+    static constexpr const char* kLabels[2] = {"Slinky++", "Adjust"};
+    constexpr float kHeight = 16.0f;
+    constexpr float kMargin = 8.0f;
+    constexpr float kPadX = 6.0f;
+    constexpr float kInset = 2.0f;
+
+    NVGcontext* vg = renderer->vg;
+    nvgFontSize(vg, 11.0f);
+    renderer->select_font(kFontRegular);
+
+    float seg_w[2]{};
+    for (int i = 0; i < 2; ++i) {
+        seg_w[i] = nvgTextBounds(vg, 0.0f, 0.0f, kLabels[i], nullptr, nullptr) + kPadX * 2.0f;
+    }
+    const float total_w = seg_w[0] + seg_w[1] + kInset * 2.0f;
+    const math::Vec4f pill = math::make_rect(
+        renderer->logical_width - kMargin - total_w,
+        renderer->logical_height - kMargin - kHeight,
+        total_w,
+        kHeight);
+
+    nvgFillColor(vg, nvgTransRGBAf(detail::color_card_bg(), 0.9f));
+    renderer->fill_rounded_rect(pill, kHeight * 0.5f);
+
+    const int active = static_cast<int>(events::get_requested_visual_style());
+    float seg_x = pill.x + kInset;
+    for (int i = 0; i < 2; ++i) {
+        const math::Vec4f seg = math::make_rect(seg_x, pill.y + kInset, seg_w[i], kHeight - kInset * 2.0f);
+        // Hit-testing works in scrolled coordinates.
+        math::Vec4f hit = seg;
+        hit.y += gui->scroll_y;
+        const bool hovered = gui->is_hovered(hit);
+        if (gui->consume_click_in(hit) && i != active) {
+            events::request_visual_style(static_cast<events::VisualStyle>(i));
+        }
+
+        if (i == active) {
+            nvgFillColor(vg, gui->accent_color);
+            renderer->fill_rounded_rect(seg, seg.h * 0.5f);
+            nvgFillColor(vg, detail::color_text_hover());
+        } else {
+            nvgFillColor(vg, hovered ? detail::color_text_muted_hover() : detail::color_text_muted());
+        }
+        renderer->draw_text(seg, kTextAlignCenterMiddle, kFontRegular, kLabels[i]);
+        seg_x += seg_w[i];
+    }
+}
+
 // Matches sub_180032C30
 void ClickGui::render(
     GuiRenderer* renderer,
@@ -1155,6 +1207,12 @@ void ClickGui::render(
         set_tooltip_anim(this, 0.0f);
     }
 
+    nvgRestore(vg);
+
+    // Visual-style switch: unscrolled screen space, fades with the GUI, inactive while a modal is open.
+    nvgSave(vg);
+    nvgGlobalAlpha(vg, 1.0f - std::pow(1.0f - open_fade_anim, 5.0f));
+    render_visual_style_switch(this, renderer);
     nvgRestore(vg);
 
     max_scroll_y = std::fmax(

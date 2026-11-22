@@ -14,6 +14,35 @@ struct ModuleSpan {
 using SetModuleKeybindFn = void (*)(Module* mod, uint32_t key_code);
 using OnModuleDisabledCleanupFn = void (*)(Module* mod);
 
+// OpenSlinky++ visual style, chosen with the small switch in the bottom-right corner of the ClickGUI.
+// A style change is requested immediately and applied on the next flush_pending_toggles() (which has a
+// GameContext), so modules leaving/entering the active style get proper state-changed events.
+enum class VisualStyle : int32_t {
+    SlinkyPlusPlus = 0,
+    Adjust         = 1,
+};
+
+VisualStyle get_active_visual_style() noexcept;    // style modules currently run under
+VisualStyle get_requested_visual_style() noexcept; // style selected in the GUI (may not be applied yet)
+void request_visual_style(VisualStyle style) noexcept;
+bool visual_style_change_pending() noexcept;
+
+// True if `mod` exists under `style` (untagged modules exist under every style).
+inline bool module_matches_style(const Module* mod, VisualStyle style) noexcept {
+    if ((mod->flags & kModuleFlagStyleSlinky) != 0) {
+        return style == VisualStyle::SlinkyPlusPlus;
+    }
+    if ((mod->flags & kModuleFlagStyleAdjust) != 0) {
+        return style == VisualStyle::Adjust;
+    }
+    return true;
+}
+
+// True if `mod` is switched on and part of the active style, i.e. it is actually running.
+inline bool module_is_running(const Module* mod) noexcept {
+    return mod->enabled && module_matches_style(mod, get_active_visual_style());
+}
+
 // Priority-sorted 27-event bus and 67-module manager (784 bytes = 0x310 @ 0x1803140E8)
 // Matches sub_180049480 .. sub_180049EF0
 class ModuleManager {
@@ -58,7 +87,7 @@ public:
 
     // Returns true if any enable/disable transitions are queued - matches sub_180049A40
     bool has_pending_toggles() const noexcept {
-        return pending_disable_count != 0 || pending_enable_count != 0;
+        return pending_disable_count != 0 || pending_enable_count != 0 || visual_style_change_pending();
     }
 
     // Applies queued enable/disable transitions, rebuilds active_callbacks, fires kEventModuleStateChanged - matches sub_180049A60
@@ -78,6 +107,7 @@ public:
 
 private:
     void rebuild_event_callbacks(uint64_t dirty_event_mask) noexcept;
+    void apply_visual_style(GameContext* ctx, OnModuleDisabledCleanupFn on_disabled_cleanup) noexcept;
 };
 static_assert(sizeof(ModuleManager) == 0x310, "ModuleManager must match exact 0x310-byte layout");
 

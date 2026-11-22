@@ -43,6 +43,9 @@ set(SLINKY_ASSET_FILES
     "${CMAKE_CURRENT_SOURCE_DIR}/assets/fonts/Inter-Medium.ttf"
     "${CMAKE_CURRENT_SOURCE_DIR}/assets/fonts/Inter-Bold.ttf"
     "${CMAKE_CURRENT_SOURCE_DIR}/assets/images/logo.png"
+    "${CMAKE_CURRENT_SOURCE_DIR}/assets/fonts/adjust/AdjustIcons.ttf"
+    "${CMAKE_CURRENT_SOURCE_DIR}/assets/fonts/adjust/AdjustIcons2.ttf"
+    "${CMAKE_CURRENT_SOURCE_DIR}/assets/fonts/adjust/SeraphTags.ttf"
 )
 
 add_custom_command(
@@ -56,6 +59,9 @@ add_custom_command(
             kFontInterMedium          "${CMAKE_CURRENT_SOURCE_DIR}/assets/fonts/Inter-Medium.ttf"
             kFontInterBold            "${CMAKE_CURRENT_SOURCE_DIR}/assets/fonts/Inter-Bold.ttf"
             kImageLogoPng             "${CMAKE_CURRENT_SOURCE_DIR}/assets/images/logo.png"
+            kFontAdjustIcons          "${CMAKE_CURRENT_SOURCE_DIR}/assets/fonts/adjust/AdjustIcons.ttf"
+            kFontAdjustIcons2         "${CMAKE_CURRENT_SOURCE_DIR}/assets/fonts/adjust/AdjustIcons2.ttf"
+            kFontSeraphTags           "${CMAKE_CURRENT_SOURCE_DIR}/assets/fonts/adjust/SeraphTags.ttf"
             kClassSlinkyHooks13       "${SLINKY_JAVA_OUT_DIR}/SlinkyHooks13.class"
             kClassSlinkyChannelHandler "${SLINKY_JAVA_OUT_DIR}/SlinkyChannelHandler.class"
     DEPENDS
@@ -113,6 +119,7 @@ set(SLINKY_CORE_SOURCES
     src/core/client.cpp
     src/util/containers.cpp
     src/util/filesystem.cpp
+    src/util/https_client.cpp
     src/util/input_win32.cpp
     src/util/keycodes.cpp
     src/util/random.cpp
@@ -169,7 +176,7 @@ set(SLINKY_MODULE_SOURCES
     src/modules/movement/sprint.cpp
     src/modules/movement/strafe.cpp
 
-    # Visual (16)
+    # Visual (17)
     src/modules/visual/anti_debuff.cpp
     src/modules/visual/block_esp.cpp
     src/modules/visual/chams.cpp
@@ -185,6 +192,7 @@ set(SLINKY_MODULE_SOURCES
     src/modules/visual/player_esp.cpp
     src/modules/visual/pointers.cpp
     src/modules/visual/trajectories.cpp
+    src/modules/visual/stats_overlay.cpp
     src/modules/visual/watermark.cpp
 
     # World / Block (9)
@@ -195,6 +203,7 @@ set(SLINKY_MODULE_SOURCES
     src/modules/world/bridge_assist.cpp
     src/modules/world/clutch.cpp
     src/modules/world/fast_mine.cpp
+    src/modules/world/fast_mine_core.cpp
     src/modules/world/fast_place.cpp
     src/modules/world/ghost_hand.cpp
 
@@ -219,9 +228,17 @@ set(SLINKY_MODULE_SOURCES
     src/modules/utility/timer.cpp
 )
 
+# OpenSlinky++ Adjust visual style: render kit (src/adjust) + ported Adjust visual modules (src/modules/adjust).
+# Globbed so new ported files are picked up automatically on the next configure.
+file(GLOB_RECURSE SLINKY_ADJUST_SOURCES CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/adjust/*.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/modules/adjust/*.cpp"
+)
+
 add_library(slinky SHARED
     ${SLINKY_CORE_SOURCES}
     ${SLINKY_MODULE_SOURCES}
+    ${SLINKY_ADJUST_SOURCES}
 )
 
 add_dependencies(slinky slinky_embedded_assets)
@@ -248,6 +265,7 @@ target_link_libraries(slinky PRIVATE
     gdi32
     user32
     shell32
+    winhttp
 )
 
 if(MINGW)

@@ -414,6 +414,7 @@ events::Module create_module() noexcept {
     mod.events[events::kEventClientShutdown] = {&on_client_shutdown, 0};
     mod.render_settings = &render_settings;
     mod.visit_config = &visit_config;
+    mod.flags |= events::kModuleFlagStyleSlinky; // OpenSlinky++: Slinky++ visual style
     return mod;
 }
 

@@ -1,6 +1,5 @@
 #include "modules/world/fast_mine.hpp"
 
-#include <cmath>
 #include <cstdint>
 #include <cstdio>
 
@@ -10,6 +9,8 @@
 #include "minecraft/game_helpers.hpp"
 #include "minecraft/item_database.hpp"
 #include "minecraft/mc_wrappers.hpp"
+#include "modules/world/bed_breaker.hpp"
+#include "modules/world/fast_mine_core.hpp"
 #include "util/containers.hpp"
 
 namespace slinky::modules {
@@ -30,8 +31,7 @@ struct FastMineState {
     events::Module base{};
 
     // Runtime state (@ 0x1803215A0 .. 0x1803215BF)
-    int32_t prev_block_hit_delay = 0;
-    float pre_tick_block_damage = 0.0f;
+    fast_mine_core::State core{};
     util::PodVector<mc::ItemIdEntry> ignored_blocks_list{};
 
     // Settings (@ 0x18030F030 .. 0x18030F127)
@@ -76,6 +76,25 @@ struct FastMineState {
 
 FastMineState g_fast_mine{};
 
+fast_mine_core::Params params() noexcept {
+    return {g_fast_mine.speed.value, g_fast_mine.break_delay.value, g_fast_mine.decr_block_hit_delay.value};
+}
+
+// True if the block under the crosshair is eligible (not in "Ignored blocks").
+bool target_block_eligible(events::GameContext* ctx) noexcept {
+    events::JniContext* jni = ctx->jni;
+    jobject mop = mc::mc_get_object_mouse_over(jni, ctx->minecraft);
+    if (mop == nullptr || mc::mop_get_type_ordinal(jni, mop) != 1) {
+        return false;
+    }
+    const mc::Vec3i pos = mc::mop_get_block_pos_vec3i(jni, mop);
+    jobject block = mc::world_get_block(jni, ctx->world, pos.x, pos.y, pos.z);
+    if (block == nullptr) {
+        return false;
+    }
+    return !mc::item_filter_list_contains_id(&g_fast_mine.ignored_blocks_list, mc::block_get_id(jni, block));
+}
+
 // Caps blockHitDelay and records pre-tick block damage (sub_180062E90)
 void on_game_tick(void* event) noexcept {
     events::GameContext* ctx = static_cast<events::ContextEvent*>(event)->ctx;
@@ -83,38 +102,21 @@ void on_game_tick(void* event) noexcept {
 
     jobject controller = mc::mc_get_player_controller(jni, ctx->minecraft);
     if (controller == nullptr) {
-        g_fast_mine.prev_block_hit_delay = 0;
+        fast_mine_core::reset(g_fast_mine.core);
         return;
     }
 
-    if (ctx->in_game_focus) {
-        jobject mop = mc::mc_get_object_mouse_over(jni, ctx->minecraft);
-        if (mop != nullptr && mc::mop_get_type_ordinal(jni, mop) == 1) {
-            const mc::Vec3i pos = mc::mop_get_block_pos_vec3i(jni, mop);
-            jobject block = mc::world_get_block(jni, ctx->world, pos.x, pos.y, pos.z);
-            if (block != nullptr) {
-                const int32_t block_id = mc::block_get_id(jni, block);
-                if (!mc::item_filter_list_contains_id(&g_fast_mine.ignored_blocks_list, block_id)) {
-                    g_fast_mine.pre_tick_block_damage = mc::controller_get_cur_block_damage(jni, controller);
-
-                    const int32_t hit_delay = mc::controller_get_block_hit_delay(jni, controller);
-                    if (static_cast<float>(hit_delay) > g_fast_mine.break_delay.value) {
-                        mc::controller_set_block_hit_delay(
-                            jni, controller, static_cast<int32_t>(g_fast_mine.break_delay.value));
-                    } else if (hit_delay > 0 &&
-                               g_fast_mine.decr_block_hit_delay.value &&
-                               hit_delay == g_fast_mine.prev_block_hit_delay) {
-                        mc::controller_set_block_hit_delay(jni, controller, hit_delay - 1);
-                    }
-
-                    g_fast_mine.prev_block_hit_delay = hit_delay;
-                    return;
-                }
-            }
-        }
+    // Bed Breaker applies its own Fast Mine while it breaks a bed; never boost the same block twice.
+    if (bed_breaker_owns_fast_mine()) {
+        fast_mine_core::skip_tick(g_fast_mine.core);
+        return;
     }
 
-    g_fast_mine.pre_tick_block_damage = -1.0f;
+    if (ctx->in_game_focus && target_block_eligible(ctx)) {
+        fast_mine_core::pre_tick(jni, controller, params(), g_fast_mine.core);
+        return;
+    }
+    fast_mine_core::skip_tick(g_fast_mine.core);
 }
 
 // Advances initial curBlockDamageMP to achieve exact ceil-quantized tick speedup (sub_180062FD0)
@@ -126,18 +128,7 @@ void on_post_living_update(void* event) noexcept {
     if (controller == nullptr) {
         return;
     }
-
-    const float cur_damage = mc::controller_get_cur_block_damage(jni, controller);
-    if (cur_damage != 0.0f && g_fast_mine.pre_tick_block_damage == 0.0f) {
-        const int64_t vanilla_ticks = static_cast<int64_t>(std::ceil(1.0f / cur_damage));
-        const float boosted_ticks_f = static_cast<float>(
-            (1.0 / static_cast<double>(g_fast_mine.speed.value)) / static_cast<double>(cur_damage));
-        const int64_t boosted_ticks = static_cast<int64_t>(std::ceil(boosted_ticks_f));
-        const int32_t multiplier_ticks =
-            static_cast<int32_t>(vanilla_ticks) - static_cast<int32_t>(boosted_ticks) + 1;
-        mc::controller_set_cur_block_damage(
-            jni, controller, static_cast<float>(multiplier_ticks) * cur_damage);
-    }
+    fast_mine_core::post_living(jni, controller, params(), g_fast_mine.core);
 }
 
 // Renders Fast Mine settings in ClickGUI (sub_1800630C0)

@@ -6,6 +6,9 @@
 #include "gui/widgets.hpp"
 #include "minecraft/game_helpers.hpp"
 #include "minecraft/mc_wrappers.hpp"
+#include "events/module_manager.hpp"
+#include "modules/adjust/render/chams/adjust_chams.hpp"
+#include "modules/adjust/render/skeleton/adjust_skeleton.hpp"
 #include "modules/module_interop.hpp"
 
 namespace slinky::modules {
@@ -30,6 +33,7 @@ events::Module create_module() noexcept {
     mod.category = events::ModuleCategory::Visual;
     mod.render_settings = &render_settings;
     mod.visit_config = &visit_config;
+    mod.flags |= events::kModuleFlagStyleSlinky; // OpenSlinky++: Slinky++ visual style
     return mod;
 }
 
@@ -46,23 +50,29 @@ void chams_render_living_model(
     float entity_yaw,
     float partial_ticks) noexcept
 {
-    const uint32_t exclude_mask = s_hide_friendlies.value
-        ? minecraft::kPlayerTagExcludedMask
-        : minecraft::kPlayerTagBot;
+    // Adjust Chams (Adjust visual style) renders the entity itself when it applies.
+    if (!adjust_chams_render_living(jni, renderer, entity, x, y, z, entity_yaw, partial_ticks)) {
+        const uint32_t exclude_mask = s_hide_friendlies.value
+            ? minecraft::kPlayerTagExcludedMask
+            : minecraft::kPlayerTagBot;
 
-    if (get_chams_module()->enabled &&
-        !minecraft::player_has_tag_flags(jni, entity, exclude_mask))
-    {
-        glEnable(GL_POLYGON_OFFSET_FILL);
-        glPolygonOffset(1.0f, -3000000.0f);
-        minecraft::renderer_living_do_render_super(
-            jni, renderer, entity, x, y, z, entity_yaw, partial_ticks);
-        glDisable(GL_POLYGON_OFFSET_FILL);
-        return;
+        if (events::module_is_running(get_chams_module()) &&
+            !minecraft::player_has_tag_flags(jni, entity, exclude_mask))
+        {
+            glEnable(GL_POLYGON_OFFSET_FILL);
+            glPolygonOffset(1.0f, -3000000.0f);
+            minecraft::renderer_living_do_render_super(
+                jni, renderer, entity, x, y, z, entity_yaw, partial_ticks);
+            glPolygonOffset(0.0f, 0.0f); // reset so later polygon offsets in Minecraft are unaffected
+            glDisable(GL_POLYGON_OFFSET_FILL);
+        } else {
+            minecraft::renderer_living_do_render_super(
+                jni, renderer, entity, x, y, z, entity_yaw, partial_ticks);
+        }
     }
 
-    minecraft::renderer_living_do_render_super(
-        jni, renderer, entity, x, y, z, entity_yaw, partial_ticks);
+    // Adjust Skeleton draws over the freshly animated player model.
+    adjust_skeleton_render_player(jni, renderer, entity, partial_ticks);
 }
 
 events::Module* get_chams_module() noexcept {

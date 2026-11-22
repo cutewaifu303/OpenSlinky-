@@ -2,6 +2,8 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
+#include <vector>
 
 #include "config/settings.hpp"
 #include "events/events.hpp"
@@ -12,49 +14,45 @@
 #include "util/math.hpp"
 #include "util/random.hpp"
 
+// Block In: walls all around you (feet + head level) and a roof, placed with silent mouse-style aim and real
+// right-clicks.
+//
+// Planner (every tick): the needed cells are the 4 lower walls, the 4 upper walls and the roof above your head.
+// For each empty cell it looks for a solid neighbour whose shared face is visible from the eye, confirmed by a
+// block raytrace (the crosshair will really hit that face). Cells without such a support get a helper block
+// first: below a wall that floats over air, or - for the roof - on top of an upper wall, which the roof can
+// then be placed against. Walls go first, then the roof support, then the roof; inside a group the cell needing
+// the smallest rotation wins. A click is only sent when the crosshair is on the planned face (CPS limited), and
+// success is read back from the world, so nothing is assumed placed.
+
 namespace slinky::modules {
 
 namespace {
 
-struct BlockOffset3 {
-    int8_t dx;
-    int8_t dy;
-    int8_t dz;
-};
+// EnumFacing ordinals: 0=Down 1=Up 2=North(-Z) 3=South(+Z) 4=West(-X) 5=East(+X)
+constexpr int32_t kFaceDown = 0;
+constexpr int32_t kFaceUp = 1;
+constexpr int32_t kFaceNorth = 2;
+constexpr int32_t kFaceSouth = 3;
+constexpr int32_t kFaceWest = 4;
+constexpr int32_t kFaceEast = 5;
 
-struct CardinalOffset2 {
-    int8_t dx;
-    int8_t dz;
-};
+constexpr double kMaxPlaceReachSq = 20.1601; // 4.49^2
+constexpr int32_t kPendingTicks = 6;         // a clicked cell is not clicked again for this long
+constexpr int32_t kStuckTicks = 40;          // nothing placeable for this long -> give up
 
-// 10 roof & roof-support offsets relative to (base_x, feet_y - 1, base_z) (@ 0x180173A50)
-constexpr BlockOffset3 kRoofCheckOffsets[10] = {
-    { 0, 3,  0}, // [0] Roof block directly above head
-    { 0, 3, -1}, // [1] North roof neighbor
-    { 1, 3,  0}, // [2] East roof neighbor
-    { 0, 3,  1}, // [3] South roof neighbor
-    {-1, 3,  0}, // [4] West roof neighbor
-    {-1, 3, -1}, // [5] NW diagonal roof support
-    { 1, 3, -1}, // [6] NE diagonal roof support
-    { 1, 3,  1}, // [7] SE diagonal roof support
-    {-1, 3,  1}, // [8] SW diagonal roof support
-    { 0, 4,  0}, // [9] Block directly above roof
-};
+// 4 cardinal directions ordered clockwise from South (+Z).
+constexpr int32_t kCardinalDx[4] = {0, -1, 0, 1};
+constexpr int32_t kCardinalDz[4] = {1, 0, -1, 0};
 
-// 4 cardinal wall offsets ordered clockwise from South (@ 0x180173A6E)
-constexpr CardinalOffset2 kCardinalWalls[4] = {
-    { 0,  1}, // 0: South (+Z)
-    {-1,  0}, // 1: West  (-X)
-    { 0, -1}, // 2: North (-Z)
-    { 1,  0}, // 3: East  (+X)
-};
-
-// Replaceable block IDs in [0, 31]: Air (0), Flowing Water (8), Water (9), Tall Grass (31)
-constexpr uint32_t kReplaceableBlockMask = 0x80000301u;
-
-bool is_replaceable_block_id(int32_t block_id) noexcept {
-    const auto id = static_cast<uint32_t>(block_id);
-    return id <= 31u && ((kReplaceableBlockMask >> id) & 1u) != 0u;
+// Air (0), flowing/still water (8, 9), flowing/still lava (10, 11), tall grass (31), fire (51), snow layer (78).
+bool is_replaceable_block_id(int32_t id) noexcept {
+    switch (id) {
+        case 0: case 8: case 9: case 10: case 11: case 31: case 51: case 78:
+            return true;
+        default:
+            return id < 0;
+    }
 }
 
 bool is_centered_in_block(const math::Vec3d& pos) noexcept {
@@ -75,29 +73,50 @@ void render_settings(gui::ClickGui* gui, gui::GuiRenderer* renderer) noexcept;
 void visit_config(config::ConfigArchive* archive) noexcept;
 
 enum class CenterMoveMode : int32_t {
-    None       = 0,
+    None = 0,
     WalkCenter = 1,
-    StopKeys   = 2,
+    StopKeys = 2,
+};
+
+struct PendingCell {
+    mc::Vec3i cell;
+    int32_t until_tick;
 };
 
 struct BlockInState {
     events::Module base{};
 
-    // Settings (@ 0x1803134F8 .. 0x18031354F)
+    // Settings
     config::BoolSetting require_ground{{}, "On ground", false, false, {}};
-    config::FloatSetting speed{{}, "Speed", "%.0f%%", 0.0f, 100.0f, 0.3f, 1.0f, 0.5f, 0.5f};
+    config::FloatSetting speed{{}, "Speed", "%.0f%%", 0.0f, 100.0f, 0.3f, 1.0f, 0.7f, 0.7f};
+    config::FloatSetting click_speed{{}, "Click speed", "%.0f CPS", 1.0f, 0.0f, 5.0f, 20.0f, 14.0f, 14.0f};
+    config::BoolSetting roof{{}, "Roof", true, true, {}};
 
-    // Runtime state (@ 0x180321D80 .. 0x180321E08)
-    uint64_t placed_mask = 0;
-    int32_t start_wall_index = 0;
+    // Planned placement (written by on_post_living_update, used by on_game_tick)
+    bool has_target = false;
+    mc::Vec3i target_cell{0, 0, 0};
+    mc::Vec3i support{0, 0, 0};
+    int32_t support_face = kFaceUp;
+
     bool spoof_rotation_active = false;
     CenterMoveMode movement_mode = CenterMoveMode::None;
     math::Vec2f center_walk_rot{0.0f, 0.0f};
-    double last_player_y = 0.0;
-    random::DriftNoise roof_drift_a{};
-    random::DriftNoise roof_drift_b{};
-    random::DriftNoise wall_x_drift{};
-    random::DriftNoise wall_z_drift{};
+    float click_cooldown_ticks = 0.0f;
+    int32_t tick_counter = 0;
+    int32_t stuck_ticks = 0;
+    std::vector<PendingCell> pending;
+
+    // The cell you stand in, fixed while airborne so a jump does not shift every planned cell.
+    bool anchor_valid = false;
+    mc::Vec3i anchor{0, 0, 0};
+    // Roof: from inside a 1x1 the top of the upper walls is above eye level, so a roof support can only be
+    // placed at the top of a jump (like a player does).
+    bool want_jump = false;
+    bool jump_overridden = false;
+    int32_t jump_grace_ticks = 0; // our own jump: "On ground" does not cancel it
+
+    random::DriftNoise aim_u_drift{};
+    random::DriftNoise aim_v_drift{};
     random::DriftNoise yaw_speed_drift{};
     random::DriftNoise pitch_speed_drift{};
 
@@ -122,19 +141,17 @@ struct BlockInState {
 
 BlockInState g_block_in{};
 
-// Scores defensive hardness of placeable blocks for Block In: Obsidian > Wood/EndStone/Cobble > Clay/Stone/Glass > Wool (sub_18006DAD0)
+// Scores defensive hardness of placeable blocks: Obsidian > Wood/EndStone/Cobble > Clay/Stone/Glass > Wool
 int score_block_in_item(int item_id) noexcept {
     switch (item_id) {
         case 49: // Obsidian
             return 4;
-
         case 4:   // Cobblestone
         case 5:   // Planks
         case 17:  // Log
         case 121: // End Stone
         case 162: // Log2
             return 3;
-
         case 1:   // Stone
         case 2:   // Grass
         case 3:   // Dirt
@@ -144,48 +161,197 @@ int score_block_in_item(int item_id) noexcept {
         case 87:  // Netherrack
         case 159: // Stained Hardened Clay
             return 2;
-
-        case 35:  // Wool
+        case 35: // Wool
             return 1;
-
         default:
             return -1;
     }
 }
 
-// Intentional empty game-tick listener registered in slot 0 (sub_18006CA40)
-void on_game_tick(void* /*event*/) noexcept {
+bool same_cell(const mc::Vec3i& a, const mc::Vec3i& b) noexcept {
+    return a.x == b.x && a.y == b.y && a.z == b.z;
 }
 
-// Initializes starting wall quadrant on enable and restores physical WASD states on disable (sub_18006CA50)
+bool is_pending(const mc::Vec3i& cell) noexcept {
+    for (const PendingCell& p : g_block_in.pending) {
+        if (same_cell(p.cell, cell) && p.until_tick > g_block_in.tick_counter) {
+            return true;
+        }
+    }
+    return false;
+}
+
+struct Candidate {
+    mc::Vec3i cell{};
+    mc::Vec3i support{};
+    int32_t face = kFaceUp;
+    math::Vec3d aim{};
+    float angle = 0.0f;
+    int32_t group = 0; // 0 = walls (+ their floor helpers), 1 = roof support, 2 = roof
+};
+
+struct Planner {
+    events::JniContext* jni;
+    jobject world;
+    jobject mutable_pos;
+    math::Vec3d eye;
+    math::Vec2f cur_rot;
+    math::AABB player_box;
+
+    int32_t block_id(int32_t x, int32_t y, int32_t z) const noexcept {
+        jobject blk = mc::world_get_block_mutable_pos(jni, world, mutable_pos, x, y, z);
+        return blk != nullptr ? mc::block_get_id(jni, blk) : -1;
+    }
+
+    bool empty(const mc::Vec3i& c) const noexcept {
+        return is_replaceable_block_id(block_id(c.x, c.y, c.z));
+    }
+
+    bool intersects_player(const mc::Vec3i& c) const noexcept {
+        const math::Vec3d lo = math::make_vec3(c.x, c.y, c.z);
+        return math::aabb_intersects(player_box, math::make_aabb(lo, math::vec3_add(lo, math::make_vec3(1.0, 1.0, 1.0))));
+    }
+
+    // Best visible, raytrace-confirmed support face for placing into `cell`.
+    bool best_face(const mc::Vec3i& cell, Candidate* out) const noexcept {
+        struct Neighbour {
+            int32_t dx, dy, dz, face;
+        };
+        constexpr Neighbour kNeighbours[6] = {
+            {0, -1, 0, kFaceUp},    {-1, 0, 0, kFaceEast},  {1, 0, 0, kFaceWest},
+            {0, 0, -1, kFaceSouth}, {0, 0, 1, kFaceNorth},  {0, 1, 0, kFaceDown},
+        };
+        const double cx = cell.x;
+        const double cy = cell.y;
+        const double cz = cell.z;
+        const double u = 0.5 + g_block_in.aim_u_drift.sample_timed({-0.2f, 0.2f}, 0.6);
+        const double v = 0.5 + g_block_in.aim_v_drift.sample_timed({-0.2f, 0.2f}, 0.6);
+
+        bool found = false;
+        for (const Neighbour& n : kNeighbours) {
+            const mc::Vec3i sup{cell.x + n.dx, cell.y + n.dy, cell.z + n.dz};
+            if (is_replaceable_block_id(block_id(sup.x, sup.y, sup.z))) {
+                continue;
+            }
+            math::Vec3d aim{};
+            bool visible = false;
+            switch (n.face) {
+                case kFaceUp:    aim = math::make_vec3(cx + u, cy, cz + v);       visible = eye.y > cy; break;
+                case kFaceDown:  aim = math::make_vec3(cx + u, cy + 1.0, cz + v); visible = eye.y < cy + 1.0; break;
+                case kFaceEast:  aim = math::make_vec3(cx, cy + u, cz + v);       visible = eye.x > cx; break;
+                case kFaceWest:  aim = math::make_vec3(cx + 1.0, cy + u, cz + v); visible = eye.x < cx + 1.0; break;
+                case kFaceSouth: aim = math::make_vec3(cx + u, cy + v, cz);       visible = eye.z > cz; break;
+                default:         aim = math::make_vec3(cx + u, cy + v, cz + 1.0); visible = eye.z < cz + 1.0; break;
+            }
+            if (!visible || math::vec3_dist_sq(eye, aim) >= kMaxPlaceReachSq) {
+                continue;
+            }
+            // The first block the crosshair ray hits must be the support, on exactly this face.
+            const math::Vec3d end = math::make_vec3(eye.x + (aim.x - eye.x) * 1.05, eye.y + (aim.y - eye.y) * 1.05,
+                                                    eye.z + (aim.z - eye.z) * 1.05);
+            jobject start_vec = mc::vec3_new(jni, eye);
+            jobject end_vec = mc::vec3_new(jni, end);
+            jobject ray = mc::world_ray_trace_blocks(jni, world, start_vec, end_vec, false, true, false);
+            bool ok = false;
+            if (ray != nullptr) {
+                if (mc::mop_get_type_ordinal(jni, ray) == 1) {
+                    const mc::Vec3i hit = mc::mop_get_block_pos_vec3i(jni, ray);
+                    ok = same_cell(hit, sup) && mc::mop_get_side_hit(jni, ray) == n.face;
+                }
+                jni->env->DeleteLocalRef(ray);
+            }
+            jni->env->DeleteLocalRef(start_vec);
+            jni->env->DeleteLocalRef(end_vec);
+            if (!ok) {
+                continue;
+            }
+            const math::Vec2f desired = math::calc_yaw_pitch(eye, aim);
+            const float angle = std::fabs(math::wrap_degrees_180(desired.x - cur_rot.x)) + std::fabs(desired.y - cur_rot.y);
+            if (!found || angle < out->angle) {
+                out->cell = cell;
+                out->support = sup;
+                out->face = n.face;
+                out->aim = aim;
+                out->angle = angle;
+                found = true;
+            }
+        }
+        return found;
+    }
+};
+
+void disable_self(events::GameContext* ctx) noexcept {
+    ctx->module_manager->request_set_enabled(&g_block_in.base, false);
+}
+
+// Right-clicks (CPS limited) whenever the crosshair is on the planned support face.
+void on_game_tick(void* event) noexcept {
+    float cd = g_block_in.click_cooldown_ticks;
+    if (cd > 0.0f) {
+        cd -= 1.0f;
+        g_block_in.click_cooldown_ticks = cd;
+        if (cd > 0.0f) {
+            return;
+        }
+    }
+
+    events::GameContext* ctx = static_cast<events::ContextEvent*>(event)->ctx;
+    if (!ctx->in_game_focus || !g_block_in.has_target) {
+        return;
+    }
+    events::JniContext* jni = ctx->jni;
+    if (!mc::is_block_item(jni, mc::player_get_held_item(jni, ctx->local_player))) {
+        return;
+    }
+    jobject mop = mc::mc_get_object_mouse_over(jni, ctx->minecraft);
+    if (mop == nullptr || mc::mop_get_type_ordinal(jni, mop) != 1) {
+        return;
+    }
+    const mc::Vec3i hit = mc::mop_get_block_pos_vec3i(jni, mop);
+    if (!same_cell(hit, g_block_in.support) || mc::mop_get_side_hit(jni, mop) != g_block_in.support_face) {
+        return;
+    }
+
+    jobject settings = mc::mc_get_game_settings(jni, ctx->minecraft);
+    mc::key_binding_increment_press_time(jni, mc::settings_get_key_use_item(jni, settings));
+    g_block_in.click_cooldown_ticks = cd + 20.0f / g_block_in.click_speed.value;
+    g_block_in.pending.push_back(PendingCell{g_block_in.target_cell, g_block_in.tick_counter + kPendingTicks});
+    g_block_in.has_target = false; // re-plan before the next click
+}
+
+// Restores the physical WASD state on disable; resets the planner on enable.
 void on_module_state_changed(void* event) noexcept {
     auto* ev = static_cast<events::ModuleStateChangedEvent*>(event);
     if (ev->module != &g_block_in.base) {
         return;
     }
-
+    g_block_in.has_target = false;
+    g_block_in.pending.clear();
+    g_block_in.stuck_ticks = 0;
+    g_block_in.click_cooldown_ticks = 0.0f;
+    g_block_in.anchor_valid = false;
+    g_block_in.want_jump = false;
+    if (ev->enabled || ev->ctx == nullptr) {
+        g_block_in.jump_overridden = false;
+        return;
+    }
     events::GameContext* ctx = ev->ctx;
     events::JniContext* jni = ctx->jni;
-    if (ev->enabled) {
-        g_block_in.placed_mask = 0;
-        const float yaw = mc::entity_get_rotation(jni, ctx->local_player).x;
-        const int32_t quadrant = static_cast<int32_t>(std::round(yaw / 90.0f));
-        g_block_in.start_wall_index = quadrant % 4;
-    } else {
-        jobject settings = mc::mc_get_game_settings(jni, ctx->minecraft);
-        jobject fwd_key = mc::settings_get_key_forward(jni, settings);
-        jobject back_key = mc::settings_get_key_back(jni, settings);
-        jobject left_key = mc::settings_get_key_left(jni, settings);
-        jobject right_key = mc::settings_get_key_right(jni, settings);
-
-        mc::key_binding_set_pressed(jni, fwd_key, mc::key_binding_is_physically_down(jni, fwd_key));
-        mc::key_binding_set_pressed(jni, back_key, mc::key_binding_is_physically_down(jni, back_key));
-        mc::key_binding_set_pressed(jni, left_key, mc::key_binding_is_physically_down(jni, left_key));
-        mc::key_binding_set_pressed(jni, right_key, mc::key_binding_is_physically_down(jni, right_key));
+    jobject settings = mc::mc_get_game_settings(jni, ctx->minecraft);
+    jobject keys[5] = {
+        mc::settings_get_key_forward(jni, settings),
+        mc::settings_get_key_back(jni, settings),
+        mc::settings_get_key_left(jni, settings),
+        mc::settings_get_key_right(jni, settings),
+        mc::settings_get_key_jump(jni, settings),
+    };
+    g_block_in.jump_overridden = false;
+    for (jobject key : keys) {
+        mc::key_binding_set_pressed(jni, key, mc::key_binding_is_physically_down(jni, key));
     }
 }
 
-// Spoofs silent rotation and steers move-fix toward block center when centering (sub_18006CBB0)
+// Silent rotation; while walking to the block centre the move-fix steers towards it.
 void on_rotation_spoof_query(void* event) noexcept {
     if (g_block_in.spoof_rotation_active) {
         auto* ev = static_cast<events::RotationSpoofEvent*>(event);
@@ -197,303 +363,233 @@ void on_rotation_spoof_query(void* event) noexcept {
     }
 }
 
-// Overrides WASD keys to walk toward block center or hold still while placing (sub_18006CBE0)
+// Overrides WASD to walk to the block centre or to stand still while placing.
 void on_pre_living_update(void* event) noexcept {
-    if (g_block_in.movement_mode == CenterMoveMode::None) {
-        return;
-    }
-
     events::GameContext* ctx = static_cast<events::ContextEvent*>(event)->ctx;
     events::JniContext* jni = ctx->jni;
     jobject settings = mc::mc_get_game_settings(jni, ctx->minecraft);
-    jobject fwd_key = mc::settings_get_key_forward(jni, settings);
-    jobject back_key = mc::settings_get_key_back(jni, settings);
-    jobject left_key = mc::settings_get_key_left(jni, settings);
-    jobject right_key = mc::settings_get_key_right(jni, settings);
 
-    mc::key_binding_set_pressed(jni, fwd_key, g_block_in.movement_mode == CenterMoveMode::WalkCenter);
-    mc::key_binding_set_pressed(jni, back_key, false);
-    mc::key_binding_set_pressed(jni, left_key, false);
-    mc::key_binding_set_pressed(jni, right_key, false);
+    // Jump for the roof support; hand the key back afterwards.
+    jobject jump_key = mc::settings_get_key_jump(jni, settings);
+    if (g_block_in.want_jump) {
+        mc::key_binding_set_pressed(jni, jump_key, true);
+        g_block_in.jump_overridden = true;
+    } else if (g_block_in.jump_overridden) {
+        mc::key_binding_set_pressed(jni, jump_key, mc::key_binding_is_physically_down(jni, jump_key));
+        g_block_in.jump_overridden = false;
+    }
+
+    if (g_block_in.movement_mode == CenterMoveMode::None) {
+        return;
+    }
+    mc::key_binding_set_pressed(jni, mc::settings_get_key_forward(jni, settings),
+                                g_block_in.movement_mode == CenterMoveMode::WalkCenter);
+    mc::key_binding_set_pressed(jni, mc::settings_get_key_back(jni, settings), false);
+    mc::key_binding_set_pressed(jni, mc::settings_get_key_left(jni, settings), false);
+    mc::key_binding_set_pressed(jni, mc::settings_get_key_right(jni, settings), false);
 }
 
-// Executes roof + 4-wall block-in sequence and centers player inside current block (sub_18006CCB0)
+// Plans the next placement and aims at it.
 void on_post_living_update(void* event) noexcept {
     g_block_in.spoof_rotation_active = false;
     g_block_in.movement_mode = CenterMoveMode::None;
+    ++g_block_in.tick_counter;
 
     events::GameContext* ctx = static_cast<events::ContextEvent*>(event)->ctx;
-    events::JniContext* jni = ctx->jni;
-
-    const auto disable_self = [&]() noexcept {
-        ctx->module_manager->request_set_enabled(&g_block_in.base, false);
-    };
-
     if (!ctx->in_game_focus) {
-        disable_self();
+        disable_self(ctx);
         return;
     }
-
+    events::JniContext* jni = ctx->jni;
     jobject player = ctx->local_player;
     const bool on_ground = mc::entity_is_on_ground(jni, player);
-    if (g_block_in.require_ground.value && !on_ground) {
-        disable_self();
+    if (g_block_in.jump_grace_ticks > 0) {
+        --g_block_in.jump_grace_ticks;
+    }
+    if (g_block_in.require_ground.value && !on_ground && g_block_in.jump_grace_ticks == 0) {
+        disable_self(ctx);
         return;
     }
 
-    math::Vec3d player_pos = mc::entity_get_position(jni, player);
+    // Drop expired pending cells.
+    std::vector<PendingCell>& pending = g_block_in.pending;
+    for (size_t i = 0; i < pending.size();) {
+        if (pending[i].until_tick <= g_block_in.tick_counter) {
+            pending[i] = pending.back();
+            pending.pop_back();
+        } else {
+            ++i;
+        }
+    }
+
+    math::Vec3d feet = mc::entity_get_position(jni, player);
     if (mc::is_version_1_7_10(jni)) {
-        player_pos = math::vec3_sub_eye_height(player_pos);
+        feet = math::vec3_sub_eye_height(feet);
     }
-
-    const int32_t base_x = static_cast<int32_t>(std::floor(player_pos.x));
-    const int32_t base_y = static_cast<int32_t>(std::floor(player_pos.y) - 1.0);
-    const int32_t base_z = static_cast<int32_t>(std::floor(player_pos.z));
-
-    if (std::fabs(player_pos.y - g_block_in.last_player_y) > 0.01) {
-        g_block_in.placed_mask = 0;
+    const mc::Vec3i here{static_cast<int32_t>(std::floor(feet.x)), static_cast<int32_t>(std::floor(feet.y)),
+                         static_cast<int32_t>(std::floor(feet.z))};
+    if (on_ground || !g_block_in.anchor_valid) {
+        g_block_in.anchor = here;
+        g_block_in.anchor_valid = true;
     }
-    g_block_in.last_player_y = player_pos.y;
+    const mc::Vec3i f = g_block_in.anchor;
+    g_block_in.want_jump = false;
 
+    // All planning JNI work (block lookups, raytraces) inside one local frame.
+    if (jni->env->PushLocalFrame(512) != 0) {
+        return;
+    }
     jobject mutable_pos = (jni->mappings->version != 0) ? mc::block_pos_new(jni, 0, 0, 0) : nullptr;
+    Planner planner{
+        jni,
+        ctx->world,
+        mutable_pos,
+        mc::vec3_to_vec3d(jni, mc::living_get_position_eyes(jni, player)),
+        math::vec2_add(mc::entity_get_rotation(jni, player), mc::get_pending_aim_rotation_delta()),
+        mc::aabb_to_aabb(jni, mc::entity_get_bounding_box(jni, player)),
+    };
 
-    bool has_target = false;
-    math::Vec3d aim_target{};
-    uint8_t placed_bit_base = 0;
-    uint8_t placed_bit_index = 0;
-
-    // 1. Check roof block (idx 0) and overhead/neighbor supports (idx 1..9)
-    for (uint32_t idx = 0; idx < 10; ++idx) {
-        const bool marked_placed = ((g_block_in.placed_mask >> idx) & (uint64_t{1} << 32)) != 0;
-        bool is_solid = marked_placed;
-        if (!is_solid) {
-            const BlockOffset3& off = kRoofCheckOffsets[idx];
-            jobject blk = mc::world_get_block_mutable_pos(
-                jni, ctx->world, mutable_pos, base_x + off.dx, base_y + off.dy, base_z + off.dz);
-            is_solid = !is_replaceable_block_id(mc::block_get_id(jni, blk));
+    bool any_missing = false;
+    bool have = false;
+    Candidate best{};
+    const auto consider = [&](const mc::Vec3i& cell, int32_t group) noexcept {
+        if (is_pending(cell) || planner.intersects_player(cell)) {
+            return false;
         }
-
-        if (!is_solid) {
-            continue;
+        Candidate c{};
+        if (!planner.best_face(cell, &c)) {
+            return false;
         }
-
-        if (idx == 0) {
-            // Roof block (0, 3, 0) is already solid; proceed to 4-wall check
-            break;
+        c.group = group;
+        if (!have || c.group < best.group || (c.group == best.group && c.angle < best.angle)) {
+            best = c;
+            have = true;
         }
+        return true;
+    };
 
-        placed_bit_base = 32;
-        placed_bit_index = (idx >= 5 && idx <= 8) ? static_cast<uint8_t>(idx - 4) : 0;
-
-        switch (idx) {
-            case 1:
-            case 5: {
-                const double y = static_cast<double>(
-                    static_cast<float>(base_y) + g_block_in.roof_drift_a.sample_timed({3.6f, 3.8f}, 0.5));
-                const double z = static_cast<double>(
-                    static_cast<float>(base_z) + g_block_in.roof_drift_b.sample_timed({-0.1f, -0.2f}, 0.5));
-                aim_target = math::make_vec3(static_cast<double>(base_x), y, z);
-                break;
-            }
-            case 2:
-            case 6: {
-                const double x = static_cast<double>(
-                    static_cast<float>(base_x) + g_block_in.roof_drift_a.sample_timed({1.1f, 1.2f}, 0.5));
-                const double y = static_cast<double>(
-                    static_cast<float>(base_y) + g_block_in.roof_drift_b.sample_timed({3.6f, 3.8f}, 0.5));
-                aim_target = math::make_vec3(x, y, static_cast<double>(base_z));
-                break;
-            }
-            case 3:
-            case 7: {
-                const double y = static_cast<double>(
-                    static_cast<float>(base_y) + g_block_in.roof_drift_a.sample_timed({3.6f, 3.8f}, 0.5));
-                const double z = static_cast<double>(
-                    static_cast<float>(base_z) + g_block_in.roof_drift_b.sample_timed({1.1f, 1.2f}, 0.5));
-                aim_target = math::make_vec3(static_cast<double>(base_x + 1), y, z);
-                break;
-            }
-            case 4:
-            case 8: {
-                const double x = static_cast<double>(
-                    static_cast<float>(base_x) + g_block_in.roof_drift_a.sample_timed({-0.1f, -0.2f}, 0.5));
-                const double y = static_cast<double>(
-                    static_cast<float>(base_y) + g_block_in.roof_drift_b.sample_timed({3.6f, 3.8f}, 0.5));
-                aim_target = math::make_vec3(x, y, static_cast<double>(base_z + 1));
-                break;
-            }
-            case 9: {
-                const double x = static_cast<double>(
-                    static_cast<float>(base_x) + g_block_in.roof_drift_a.sample_timed({0.4f, 0.6f}, 0.5));
-                const double z = static_cast<double>(
-                    static_cast<float>(base_z) + g_block_in.roof_drift_b.sample_timed({0.4f, 0.6f}, 0.5));
-                aim_target = math::make_vec3(x, static_cast<double>(base_y + 4), z);
-                break;
-            }
-            default:
-                break;
-        }
-
-        has_target = true;
-        break;
-    }
-
-    // 2. Check the 4 cardinal walls around the player (levels: floor support, lower wall, upper wall)
-    if (!has_target) {
-        for (int32_t step = 0; step < 4; ++step) {
-            const uint32_t dir = static_cast<uint32_t>(g_block_in.start_wall_index + step) & 3u;
-            const CardinalOffset2 wall = kCardinalWalls[dir];
-            const int32_t wx = base_x + wall.dx;
-            const int32_t wz = base_z + wall.dz;
-
-            const math::AABB player_box = mc::aabb_to_aabb(jni, mc::entity_get_bounding_box(jni, player));
-            const math::Vec3d col_min = math::make_vec3(
-                static_cast<double>(wx), static_cast<double>(base_y), static_cast<double>(wz));
-            const math::Vec3d col_max = math::vec3_add(col_min, math::make_vec3(1.0, 3.0, 1.0));
-            const math::AABB col_box = math::make_aabb(col_min, col_max);
-            if (math::aabb_intersects(player_box, col_box)) {
+    // Walls: feet and head level in all 4 directions (a floor helper below a wall that floats over air).
+    for (int32_t d = 0; d < 4; ++d) {
+        for (int32_t level = 0; level < 2; ++level) {
+            const mc::Vec3i cell{f.x + kCardinalDx[d], f.y + level, f.z + kCardinalDz[d]};
+            if (!planner.empty(cell)) {
                 continue;
             }
-
-            const uint32_t base_bit = dir * 3u;
-            int32_t target_level = -1;
-            math::Range2f drift_range{};
-
-            // Level 0: Floor support at (wx, base_y, wz)
-            if ((g_block_in.placed_mask & (uint64_t{1} << base_bit)) == 0) {
-                jobject blk_cur = mc::world_get_block_mutable_pos(jni, ctx->world, mutable_pos, wx, base_y, wz);
-                if (is_replaceable_block_id(mc::block_get_id(jni, blk_cur))) {
-                    jobject blk_below =
-                        mc::world_get_block_mutable_pos(jni, ctx->world, mutable_pos, wx, base_y - 1, wz);
-                    if (!is_replaceable_block_id(mc::block_get_id(jni, blk_below))) {
-                        target_level = 0;
-                        placed_bit_index = static_cast<uint8_t>(base_bit);
-                        drift_range = {-0.25f, -0.4f};
-                    }
+            any_missing = true;
+            if (!consider(cell, 0) && level == 0) {
+                const mc::Vec3i below{cell.x, cell.y - 1, cell.z};
+                if (planner.empty(below)) {
+                    consider(below, 0);
                 }
-            }
-
-            // Level 1: Lower wall block at (wx, base_y + 1, wz)
-            if (target_level == -1 && (g_block_in.placed_mask & (uint64_t{1} << (base_bit + 1u))) == 0) {
-                jobject blk_cur = mc::world_get_block_mutable_pos(jni, ctx->world, mutable_pos, wx, base_y + 1, wz);
-                if (is_replaceable_block_id(mc::block_get_id(jni, blk_cur))) {
-                    jobject blk_below = mc::world_get_block_mutable_pos(jni, ctx->world, mutable_pos, wx, base_y, wz);
-                    if (!is_replaceable_block_id(mc::block_get_id(jni, blk_below))) {
-                        target_level = 1;
-                        placed_bit_index = static_cast<uint8_t>(base_bit + 1u);
-                        drift_range = {0.25f, 0.4f};
-                    }
-                }
-            }
-
-            // Level 2: Upper wall block at (wx, base_y + 2, wz)
-            if (target_level == -1 && (g_block_in.placed_mask & (uint64_t{1} << (base_bit + 2u))) == 0) {
-                jobject blk_cur = mc::world_get_block_mutable_pos(jni, ctx->world, mutable_pos, wx, base_y + 2, wz);
-                if (is_replaceable_block_id(mc::block_get_id(jni, blk_cur))) {
-                    jobject blk_below =
-                        mc::world_get_block_mutable_pos(jni, ctx->world, mutable_pos, wx, base_y + 1, wz);
-                    if (!is_replaceable_block_id(mc::block_get_id(jni, blk_below))) {
-                        target_level = 2;
-                        placed_bit_index = static_cast<uint8_t>(base_bit + 2u);
-                        drift_range = {0.25f, 0.4f};
-                    }
-                }
-            }
-
-            if (target_level != -1) {
-                const double x_off = 0.5 - static_cast<double>(
-                    g_block_in.wall_x_drift.sample_timed(drift_range, 0.5) * static_cast<float>(wall.dx));
-                const double z_off = 0.5 - static_cast<double>(
-                    g_block_in.wall_z_drift.sample_timed(drift_range, 0.5) * static_cast<float>(wall.dz));
-                aim_target = math::make_vec3(
-                    static_cast<double>(wx) + x_off,
-                    static_cast<double>(base_y + target_level),
-                    static_cast<double>(wz) + z_off);
-                placed_bit_base = 0;
-                has_target = true;
-                break;
             }
         }
     }
 
-    if (!has_target) {
-        if (on_ground && is_centered_in_block(player_pos)) {
-            disable_self();
+    // Roof above the head; without a neighbour to place against, first put a support on top of an upper wall.
+    bool roof_needs_jump = false;
+    if (g_block_in.roof.value) {
+        const mc::Vec3i roof{f.x, f.y + 2, f.z};
+        if (planner.empty(roof)) {
+            any_missing = true;
+            if (!consider(roof, 2)) {
+                bool support_possible = false;
+                bool support_placeable = false;
+                for (int32_t d = 0; d < 4; ++d) {
+                    const mc::Vec3i side{f.x + kCardinalDx[d], f.y + 2, f.z + kCardinalDz[d]};
+                    const mc::Vec3i wall{side.x, f.y + 1, side.z};
+                    if (planner.empty(side) && !planner.empty(wall)) {
+                        support_possible = true;
+                        support_placeable = consider(side, 1) || support_placeable;
+                    }
+                }
+                roof_needs_jump = support_possible && !support_placeable;
+            }
         }
+    }
+
+    jni->env->PopLocalFrame(nullptr);
+
+    if (!any_missing) {
+        // Done; finish once standing centred so the walls fit snugly.
+        g_block_in.has_target = false;
+        if (on_ground && is_centered_in_block(feet)) {
+            disable_self(ctx);
+            return;
+        }
+    } else if (!have) {
+        g_block_in.has_target = false;
+        if (roof_needs_jump && on_ground && is_centered_in_block(feet) && pending.empty()) {
+            g_block_in.want_jump = true; // the roof support becomes visible at the top of the jump
+            g_block_in.jump_grace_ticks = 15;
+            g_block_in.stuck_ticks = 0;
+        } else if (pending.empty() && ++g_block_in.stuck_ticks > kStuckTicks) {
+            disable_self(ctx); // nothing reachable to place against
+            return;
+        }
+    }
+
+    // Walk to (or stay in) the block centre, so no wall cell is blocked by the player's hitbox.
+    if (is_centered_in_block(feet)) {
+        g_block_in.movement_mode = CenterMoveMode::StopKeys;
+    } else {
+        const math::Vec3d center = math::make_vec3(std::floor(feet.x) + 0.5, feet.y, std::floor(feet.z) + 0.5);
+        g_block_in.movement_mode = CenterMoveMode::WalkCenter;
+        g_block_in.center_walk_rot = math::calc_yaw_pitch(feet, center);
+    }
+    g_block_in.spoof_rotation_active = true;
+
+    if (!have) {
         return;
     }
+    g_block_in.stuck_ticks = 0;
 
     if (!mc::try_claim_aim_priority(500u)) {
-        disable_self();
+        g_block_in.has_target = false;
         return;
     }
-
     mc::select_hotbar_slot_by_scorer(ctx, &g_block_in.base, true, score_block_in_item);
-    jobject held_item = mc::player_get_held_item(jni, player);
-    if (!mc::is_block_item(jni, held_item)) {
-        disable_self();
+    if (!mc::is_block_item(jni, mc::player_get_held_item(jni, player))) {
+        disable_self(ctx); // no blocks in the hotbar
         return;
     }
 
-    const math::Vec2f cur_rot = math::vec2_add(
-        mc::entity_get_rotation(jni, player),
-        mc::get_pending_aim_rotation_delta());
-    const math::Vec3d eye_pos = mc::vec3_to_vec3d(jni, mc::living_get_position_eyes(jni, player));
-    const math::Vec2f desired_rot = math::calc_yaw_pitch(eye_pos, aim_target);
-    const math::Vec2f raw_diff = math::vec2_sub(desired_rot, cur_rot);
+    g_block_in.has_target = true;
+    g_block_in.target_cell = best.cell;
+    g_block_in.support = best.support;
+    g_block_in.support_face = best.face;
+
+    // Mouse-style aim: proportional step blended with a clamped step (as before), faster with "Speed".
+    const math::Vec2f desired = math::calc_yaw_pitch(planner.eye, best.aim);
+    const math::Vec2f raw_diff = math::vec2_sub(desired, planner.cur_rot);
     const float yaw_diff = math::wrap_degrees_180(raw_diff.x);
     const float pitch_diff = raw_diff.y;
-
-    const float prop_factor = static_cast<float>(static_cast<double>(g_block_in.speed.value) * 0.5 + 0.5);
+    const float speed = g_block_in.speed.value;
+    const float prop_factor = speed * 0.5f + 0.5f;
     const math::Vec2f prop_step = math::vec2_scale({yaw_diff, pitch_diff}, prop_factor);
-
-    const float max_yaw_step =
-        g_block_in.yaw_speed_drift.sample_timed({0.8f, 1.2f}, 0.2) * 180.0f * g_block_in.speed.value;
-    const float max_pitch_step =
-        g_block_in.pitch_speed_drift.sample_timed({0.8f, 1.2f}, 0.2) * 180.0f * g_block_in.speed.value;
+    const float max_yaw_step = g_block_in.yaw_speed_drift.sample_timed({0.8f, 1.2f}, 0.2) * 180.0f * speed;
+    const float max_pitch_step = g_block_in.pitch_speed_drift.sample_timed({0.8f, 1.2f}, 0.2) * 180.0f * speed;
     const math::Vec2f clamped_step{
         math::clampf(-max_yaw_step, max_yaw_step, yaw_diff),
         math::clampf(-max_pitch_step, max_pitch_step, pitch_diff),
     };
-
-    const math::Vec2f final_step = math::vec2_lerp(prop_step, clamped_step, 0.5f);
-    mc::queue_aim_rotation_delta(final_step);
-
-    const float rem_yaw = std::fabs(yaw_diff - final_step.x);
-    const float rem_pitch = std::fabs(pitch_diff - final_step.y);
-    if ((rem_yaw + rem_pitch) < 1.0f) {
-        jobject settings = mc::mc_get_game_settings(jni, ctx->minecraft);
-        jobject use_key = mc::settings_get_key_use_item(jni, settings);
-        mc::key_binding_increment_press_time(jni, use_key);
-        g_block_in.placed_mask |= (uint64_t{1} << static_cast<uint32_t>(placed_bit_base + placed_bit_index));
-    }
-
-    g_block_in.spoof_rotation_active = true;
-    if (is_centered_in_block(player_pos)) {
-        g_block_in.movement_mode = CenterMoveMode::StopKeys;
-    } else {
-        const math::Vec3d block_center = math::make_vec3(
-            std::floor(player_pos.x) + 0.5,
-            player_pos.y,
-            std::floor(player_pos.z) + 0.5);
-        g_block_in.movement_mode = CenterMoveMode::WalkCenter;
-        g_block_in.center_walk_rot = math::calc_yaw_pitch(player_pos, block_center);
-    }
+    mc::queue_aim_rotation_delta(math::vec2_lerp(prop_step, clamped_step, 0.5f));
 }
 
-// Renders Block In settings in ClickGUI (sub_18006DA30)
 void render_settings(gui::ClickGui* gui, gui::GuiRenderer* renderer) noexcept {
     gui::widgets::render_section_header(gui, renderer, "Main");
     g_block_in.speed.render(gui, renderer);
+    g_block_in.click_speed.render(gui, renderer);
+    g_block_in.roof.render(gui, renderer);
 
     gui::widgets::render_section_header(gui, renderer, "Conditions");
     g_block_in.require_ground.render(gui, renderer);
 }
 
-// Serializes/deserializes Block In config (sub_18006DA90)
 void visit_config(config::ConfigArchive* archive) noexcept {
     g_block_in.speed.visit(archive, "speed");
     g_block_in.require_ground.visit(archive, "require_ground");
+    g_block_in.click_speed.visit(archive, "click_speed");
+    g_block_in.roof.visit(archive, "roof");
 }
 
 } // namespace

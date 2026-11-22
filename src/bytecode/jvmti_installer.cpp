@@ -3,8 +3,11 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <string>
+#include <vector>
 
+#include "bytecode/extra_hooks.hpp"
 #include "embedded_assets.hpp"
 
 namespace slinky::bytecode {
@@ -656,6 +659,285 @@ void build_active_patch_specs(const HookTargetContext& target) noexcept {
     g_class_patch_specs[8] = {target.cls_entity_living_base, s.elb_hooks, 1, s.elb_methods, 1};
 }
 
+jclass try_load_class_via_loader(JNIEnv* env, jobject class_loader, jmethodID load_class_mid, const char* class_name);
+
+// ============================================================================
+// OpenSlinky++: base table + extra hooks merged into one spec per class
+// ============================================================================
+struct MergedTarget {
+    const char* owner;
+    const char* name;
+    const char* desc;
+    HookInsnKind kind;
+    size_t hook_index;
+};
+
+struct MergedMethod {
+    const char* name;
+    const char* desc;
+    bool wildcard;
+    std::vector<MergedTarget> targets;
+};
+
+struct MergedClass {
+    jclass cls = nullptr;
+    bool owns_global_ref = false; // created for an extra hook (base classes belong to Mappings)
+    int base_index = -1;          // index into g_class_patch_specs, -1 for classes only extra hooks touch
+    std::vector<HookMethodEntry> hooks;
+    std::vector<MergedMethod> methods;
+    std::vector<std::vector<InsnPatchTarget>> final_targets;
+    std::vector<MethodPatchSpec> final_methods;
+};
+
+std::deque<MergedClass> g_merged_classes; // deque: element addresses stay stable
+std::vector<ClassPatchSpec> g_all_specs;  // what the ClassFileLoadHook / retransform / uninstall use
+
+size_t base_hook_index(const ClassPatchSpec& spec, const uint16_t* cp_index_ptr) noexcept {
+    for (size_t k = 0; k < spec.hook_method_count; ++k) {
+        if (&spec.hook_methods[k].resolved_cp_index == cp_index_ptr) {
+            return k;
+        }
+    }
+    return 0;
+}
+
+const char* pick_member_name(size_t env_idx, const ExtraMemberNames& n) noexcept {
+    return env_idx == 0 ? n.vanilla_name : (env_idx == 1 ? n.mcp_name : n.srg_name);
+}
+
+const char* pick_member_desc(size_t env_idx, const ExtraMemberNames& n) noexcept {
+    return env_idx == 0 ? n.vanilla_desc : (env_idx == 1 ? n.mcp_desc : n.srg_desc);
+}
+
+bool same_str(const char* a, const char* b) noexcept {
+    return a == b || (a != nullptr && b != nullptr && std::strcmp(a, b) == 0);
+}
+
+bool same_target(const MergedTarget& a, const MergedTarget& b) noexcept {
+    return a.kind == b.kind && same_str(a.owner, b.owner) && same_str(a.name, b.name) && same_str(a.desc, b.desc);
+}
+
+MergedMethod& find_or_add_method(MergedClass& mc, const char* name, const char* desc, bool wildcard) {
+    for (MergedMethod& m : mc.methods) {
+        if (m.wildcard == wildcard && (wildcard || (same_str(m.name, name) && same_str(m.desc, desc)))) {
+            return m;
+        }
+    }
+    const char* const wc = wildcard_method_str();
+    mc.methods.push_back(MergedMethod{wildcard ? wc : name, wildcard ? wc : desc, wildcard, {}});
+    return mc.methods.back();
+}
+
+size_t find_or_add_hook(MergedClass& mc, const char* native_name, const char* native_desc) {
+    for (size_t k = 0; k < mc.hooks.size(); ++k) {
+        if (same_str(mc.hooks[k].name, native_name)) {
+            return k;
+        }
+    }
+    mc.hooks.push_back(HookMethodEntry{native_name, native_desc, 0});
+    return mc.hooks.size() - 1;
+}
+
+// Specific methods win over the wildcard in select_method_patcher, so wildcard targets are copied into every
+// specific method of the class, specific methods are ordered first, then the final arrays are materialized.
+void finalize_merged_class(MergedClass& mc) {
+    const MergedMethod* wildcard = nullptr;
+    for (const MergedMethod& m : mc.methods) {
+        if (m.wildcard) {
+            wildcard = &m;
+        }
+    }
+    std::vector<MergedMethod> ordered;
+    for (const MergedMethod& m : mc.methods) {
+        if (m.wildcard) {
+            continue;
+        }
+        MergedMethod copy = m;
+        if (wildcard != nullptr) {
+            for (const MergedTarget& t : wildcard->targets) {
+                bool present = false;
+                for (const MergedTarget& existing : copy.targets) {
+                    present = present || same_target(existing, t);
+                }
+                if (!present) {
+                    copy.targets.push_back(t);
+                }
+            }
+        }
+        ordered.push_back(std::move(copy));
+    }
+    if (wildcard != nullptr) {
+        ordered.push_back(*wildcard);
+    }
+    mc.methods = std::move(ordered);
+
+    mc.final_targets.clear();
+    mc.final_targets.reserve(mc.methods.size());
+    for (const MergedMethod& m : mc.methods) {
+        std::vector<InsnPatchTarget> targets;
+        targets.reserve(m.targets.size());
+        for (const MergedTarget& t : m.targets) {
+            targets.push_back(InsnPatchTarget{t.owner, t.name, t.desc, t.kind, &mc.hooks[t.hook_index].resolved_cp_index});
+        }
+        mc.final_targets.push_back(std::move(targets));
+    }
+    mc.final_methods.clear();
+    for (size_t i = 0; i < mc.methods.size(); ++i) {
+        mc.final_methods.push_back(MethodPatchSpec{
+            mc.methods[i].name, mc.methods[i].desc, mc.final_targets[i].data(), mc.final_targets[i].size()});
+    }
+}
+
+void build_merged_patch_specs(JNIEnv* env, const HookTargetContext& target) {
+    g_merged_classes.clear();
+    g_all_specs.clear();
+
+    // 1. The original 9-class table.
+    for (size_t i = 0; i < kHookedClassCount; ++i) {
+        const ClassPatchSpec& spec = g_class_patch_specs[i];
+        if (spec.target_class == nullptr) {
+            continue;
+        }
+        MergedClass& mc = g_merged_classes.emplace_back();
+        mc.cls = spec.target_class;
+        mc.base_index = static_cast<int>(i);
+        mc.hooks.assign(spec.hook_methods, spec.hook_methods + spec.hook_method_count);
+        for (size_t m = 0; m < spec.method_patch_count; ++m) {
+            const MethodPatchSpec& mp = spec.method_patches[m];
+            const bool wildcard = mp.method_name == wildcard_method_str() && mp.method_descriptor == wildcard_method_str();
+            MergedMethod merged{mp.method_name, mp.method_descriptor, wildcard, {}};
+            for (size_t t = 0; t < mp.target_count; ++t) {
+                const InsnPatchTarget& it = mp.targets[t];
+                merged.targets.push_back(
+                    MergedTarget{it.owner, it.name, it.descriptor, it.kind, base_hook_index(spec, it.hook_cp_index_ptr)});
+            }
+            mc.methods.push_back(std::move(merged));
+        }
+    }
+
+    // 2. Extra hooks (1.8.9 only).
+    if (target.mc_version != McVersion::V1_7_10 && env != nullptr) {
+        size_t e = static_cast<size_t>(target.mapping_env);
+        if (e > 2u) {
+            e = 0u;
+        }
+        for (const ExtraHookSpec* const* it = all_extra_hooks(); it != nullptr && *it != nullptr; ++it) {
+            const ExtraHookSpec& h = **it;
+            const char* class_name = (e == 0u) ? h.class_vanilla : h.class_named;
+            const char* owner_name = (e == 0u) ? h.owner_vanilla : h.owner_named;
+            const char* target_name = pick_member_name(e, h.target);
+            const char* target_desc = pick_member_desc(e, h.target);
+            if (class_name == nullptr || owner_name == nullptr || target_name == nullptr || target_desc == nullptr ||
+                h.native_name == nullptr || h.native_desc == nullptr) {
+                continue;
+            }
+            jclass local = try_load_class_via_loader(env, target.class_loader, target.load_class_mid, class_name);
+            if (local == nullptr) {
+                env->ExceptionClear();
+                continue; // class not present in this environment
+            }
+            MergedClass* mc = nullptr;
+            for (MergedClass& existing : g_merged_classes) {
+                if (env->IsSameObject(existing.cls, local) == JNI_TRUE) {
+                    mc = &existing;
+                    break;
+                }
+            }
+            if (mc == nullptr) {
+                mc = &g_merged_classes.emplace_back();
+                mc->cls = static_cast<jclass>(env->NewGlobalRef(local));
+                mc->owns_global_ref = true;
+            }
+            env->DeleteLocalRef(local);
+
+            const char* method_name = pick_member_name(e, h.method);
+            const char* method_desc = pick_member_desc(e, h.method);
+            const bool wildcard = method_name == nullptr && method_desc == nullptr;
+            if (!wildcard && (method_name == nullptr || method_desc == nullptr)) {
+                continue;
+            }
+            const size_t hook_index = find_or_add_hook(*mc, h.native_name, h.native_desc);
+            MergedMethod& m = find_or_add_method(*mc, method_name, method_desc, wildcard);
+            const MergedTarget t{owner_name, target_name, target_desc, h.kind, hook_index};
+            bool present = false;
+            for (const MergedTarget& existing : m.targets) {
+                present = present || same_target(existing, t);
+            }
+            if (!present) {
+                m.targets.push_back(t);
+            }
+        }
+    }
+
+    // 3. Materialize.
+    for (MergedClass& mc : g_merged_classes) {
+        finalize_merged_class(mc);
+        g_all_specs.push_back(ClassPatchSpec{
+            mc.cls, mc.hooks.data(), mc.hooks.size(), mc.final_methods.data(), mc.final_methods.size()});
+    }
+}
+
+// Retransforms the merged classes one by one so a single broken extra hook (verify error, rewrite failure)
+// cannot take every hook down: such a class falls back to its original base-table spec, or - when only extra
+// hooks touch it - is left unpatched. A base-table class that still fails is fatal, like the original single
+// RetransformClasses call; the classes already patched are restored before the error is returned.
+int retransform_merged_classes(jvmtiEnv* jvmti) noexcept {
+    std::vector<jclass> patched;
+    auto fail = [&](int err) noexcept {
+        jvmti->SetEventNotificationMode(JVMTI_DISABLE, JVMTI_EVENT_CLASS_FILE_LOAD_HOOK, nullptr);
+        if (!patched.empty()) {
+            jvmti->RetransformClasses(static_cast<jint>(patched.size()), patched.data()); // back to vanilla
+        }
+        return err;
+    };
+    auto attempt = [&](jclass cls) noexcept {
+        g_hook_rewrite_error.store(0, std::memory_order_release);
+        const jvmtiError err = jvmti->RetransformClasses(1, &cls);
+        if (err != JVMTI_ERROR_NONE) {
+            return static_cast<int>(err) + kErrJvmtiBase;
+        }
+        return g_hook_rewrite_error.load(std::memory_order_acquire);
+    };
+
+    for (size_t k = 0; k < g_all_specs.size(); ++k) {
+        ClassPatchSpec& spec = g_all_specs[k];
+        if (spec.target_class == nullptr) {
+            continue;
+        }
+        int err = attempt(spec.target_class);
+        if (err != 0) {
+            const MergedClass& mc = g_merged_classes[k];
+            const bool has_extras = mc.base_index < 0 ||
+                mc.hooks.size() != g_class_patch_specs[mc.base_index].hook_method_count;
+            if (!has_extras) {
+                return fail(err);
+            }
+            if (mc.base_index < 0) {
+                spec.target_class = nullptr; // extra-only class: leave it vanilla
+                continue;
+            }
+            spec = g_class_patch_specs[mc.base_index]; // drop this class's extra hooks
+            err = attempt(spec.target_class);
+            if (err != 0) {
+                return fail(err);
+            }
+        }
+        patched.push_back(spec.target_class);
+    }
+    g_hook_rewrite_error.store(0, std::memory_order_release);
+    return kInstallOk;
+}
+
+void release_merged_patch_specs(JNIEnv* env) noexcept {
+    for (MergedClass& mc : g_merged_classes) {
+        if (mc.owns_global_ref && mc.cls != nullptr && env != nullptr) {
+            env->DeleteGlobalRef(mc.cls);
+        }
+    }
+    g_merged_classes.clear();
+    g_all_specs.clear();
+}
+
 // sub_180040A60: Load class by name via ClassLoader.loadClass(String), converting '/' -> '.'
 jclass try_load_class_via_loader(
     JNIEnv* env,
@@ -816,10 +1098,10 @@ void JNICALL jvmti_class_file_load_hook(
     }
 
     ClassPatchSpec* matched_spec = nullptr;
-    for (size_t i = 0; i < kHookedClassCount; ++i) {
-        if (g_class_patch_specs[i].target_class != nullptr &&
-            jni_env->IsSameObject(g_class_patch_specs[i].target_class, class_being_redefined) == JNI_TRUE) {
-            matched_spec = &g_class_patch_specs[i];
+    for (ClassPatchSpec& spec : g_all_specs) {
+        if (spec.target_class != nullptr &&
+            jni_env->IsSameObject(spec.target_class, class_being_redefined) == JNI_TRUE) {
+            matched_spec = &spec;
             break;
         }
     }
@@ -897,6 +1179,23 @@ int install_jvmti_hooks(JNIEnv* env, jvmtiEnv* jvmti, const HookTargetContext& t
         {const_cast<char*>("updateController"),         const_cast<char*>("(Ljava/lang/Object;)V"),                                      reinterpret_cast<void*>(g_hook_callbacks.update_controller)},
     };
 
+    // Base natives + OpenSlinky++ extra hook natives (all declared in SlinkyHooks13.java).
+    std::vector<JNINativeMethod> all_natives(native_methods, native_methods + kSlinkyHookMethodCount);
+    for (const ExtraHookSpec* const* it = all_extra_hooks(); it != nullptr && *it != nullptr; ++it) {
+        const ExtraHookSpec& h = **it;
+        if (h.native_name == nullptr || h.native_desc == nullptr || h.native_fn == nullptr) {
+            continue;
+        }
+        bool duplicate = false;
+        for (const JNINativeMethod& existing : all_natives) {
+            duplicate = duplicate || std::strcmp(existing.name, h.native_name) == 0;
+        }
+        if (!duplicate) {
+            all_natives.push_back(JNINativeMethod{
+                const_cast<char*>(h.native_name), const_cast<char*>(h.native_desc), h.native_fn});
+        }
+    }
+
     jclass local_hooks_cls = nullptr;
     const int def_err = define_and_register_hooks_class(
         env,
@@ -905,8 +1204,8 @@ int install_jvmti_hooks(JNIEnv* env, jvmtiEnv* jvmti, const HookTargetContext& t
         target.load_class_mid,
         assets::kClassSlinkyHooks13,
         static_cast<jsize>(assets::kClassSlinkyHooks13_size),
-        native_methods,
-        static_cast<jint>(kSlinkyHookMethodCount),
+        all_natives.data(),
+        static_cast<jint>(all_natives.size()),
         &local_hooks_cls);
     if (def_err != kInstallOk) {
         return def_err;
@@ -935,25 +1234,12 @@ int install_jvmti_hooks(JNIEnv* env, jvmtiEnv* jvmti, const HookTargetContext& t
     }
 
     build_active_patch_specs(target);
+    build_merged_patch_specs(env, target);
     g_hook_rewrite_error.store(0, std::memory_order_release);
 
-    const jclass classes_to_retransform[kHookedClassCount] = {
-        target.cls_minecraft,
-        target.cls_entity_renderer,
-        target.cls_render_manager,
-        target.cls_renderer_living_entity,
-        target.cls_render_player,
-        target.cls_net_handler_play,
-        target.cls_world_client,
-        target.cls_entity,
-        target.cls_entity_living_base,
-    };
-
-    jvmti_err = jvmti->RetransformClasses(
-        static_cast<jint>(kHookedClassCount), classes_to_retransform);
-    if (jvmti_err != JVMTI_ERROR_NONE) {
-        jvmti->SetEventNotificationMode(JVMTI_DISABLE, JVMTI_EVENT_CLASS_FILE_LOAD_HOOK, nullptr);
-        return static_cast<int>(jvmti_err) + kErrJvmtiBase;
+    const int retransform_err = retransform_merged_classes(jvmti);
+    if (retransform_err != kInstallOk) {
+        return retransform_err;
     }
 
     g_hooks_installed.store(true, std::memory_order_release);
@@ -1024,15 +1310,15 @@ int uninstall_jvmti_hooks(JNIEnv* env, jvmtiEnv* jvmti) {
             if (jvmti_err != JVMTI_ERROR_NONE) {
                 status = static_cast<int>(jvmti_err) + kErrJvmtiBase;
             } else {
-                jclass classes_to_restore[kHookedClassCount]{};
-                jint valid_count = 0;
-                for (size_t i = 0; i < kHookedClassCount; ++i) {
-                    if (g_class_patch_specs[i].target_class != nullptr) {
-                        classes_to_restore[valid_count++] = g_class_patch_specs[i].target_class;
+                std::vector<jclass> classes_to_restore;
+                for (const ClassPatchSpec& spec : g_all_specs) {
+                    if (spec.target_class != nullptr) {
+                        classes_to_restore.push_back(spec.target_class);
                     }
                 }
-                if (valid_count > 0) {
-                    jvmti_err = jvmti->RetransformClasses(valid_count, classes_to_restore);
+                if (!classes_to_restore.empty()) {
+                    jvmti_err = jvmti->RetransformClasses(
+                        static_cast<jint>(classes_to_restore.size()), classes_to_restore.data());
                 }
                 if (jvmti_err != JVMTI_ERROR_NONE) {
                     status = static_cast<int>(jvmti_err) + kErrJvmtiBase;
@@ -1052,6 +1338,7 @@ int uninstall_jvmti_hooks(JNIEnv* env, jvmtiEnv* jvmti) {
         env->DeleteGlobalRef(g_slinky_hooks_class);
         g_slinky_hooks_class = nullptr;
     }
+    release_merged_patch_specs(env);
 
     return status;
 }

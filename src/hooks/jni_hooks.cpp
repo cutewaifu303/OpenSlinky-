@@ -3,11 +3,13 @@
 #include <cstring>
 #include <glad/glad.h>
 
+#include "adjust/hooks/camera_hooks.hpp"
 #include "commands/command_manager.hpp"
 #include "core/client.hpp"
 #include "hooks/channel_handler.hpp"
 #include "minecraft/game_helpers.hpp"
 #include "minecraft/mc_wrappers.hpp"
+#include "events/module_manager.hpp"
 #include "modules/module_interop.hpp"
 #include "modules/world/bridge.hpp"
 #include "util/filesystem.hpp"
@@ -110,7 +112,7 @@ jboolean JNICALL hook_is_display_active_pre_render(JNIEnv* env, jclass cls) noex
     events::JniContext jni{rt.mappings, env};
 
     minecraft::pre_living_update_spoof_rotation(&jni);
-    if (modules::get_no_hurt_cam_module()->enabled) {
+    if (events::module_is_running(modules::get_no_hurt_cam_module())) {
         modules::no_hurt_cam_apply(&jni);
     }
     return minecraft::lwjgl_display_is_active(&jni) ? JNI_TRUE : JNI_FALSE;
@@ -149,11 +151,14 @@ void JNICALL hook_update_display(JNIEnv* env, jclass cls) noexcept {
 
     bool overlay_just_disabled = false;
     if (rt.module_manager.has_pending_toggles()) {
-        const bool was_overlay_on = modules::get_mod_overlay_module()->enabled;
+        const bool was_overlay_on = events::module_is_running(modules::get_mod_overlay_module());
+        const events::VisualStyle style_before = events::get_active_visual_style();
         core::acquire_packet_lock();
         rt.module_manager.flush_pending_toggles(&ctx);
         core::release_packet_lock();
-        overlay_just_disabled = was_overlay_on && !modules::get_mod_overlay_module()->enabled;
+        overlay_just_disabled = was_overlay_on && !events::module_is_running(modules::get_mod_overlay_module());
+        // A visual-style switch swaps every HUD module: refresh the GUI layer like after a resize.
+        overlay_just_disabled = overlay_just_disabled || style_before != events::get_active_visual_style();
     }
 
     const double now = time::now_seconds();
@@ -392,10 +397,17 @@ void JNICALL hook_orient_camera(
         minecraft::render_global_set_entities_dirty(&jni, render_global, true);
         minecraft::post_living_update_restore_rotation(&jni, player);
         minecraft::swap_render_spoof_rotations(&jni, player, true);
+        adjust::hooks::CameraOrientState cam{};
+        adjust::hooks::camera_orient_begin(&jni, entity_renderer, &cam);
         minecraft::entity_renderer_orient_camera(&jni, entity_renderer, partial_ticks);
+        adjust::hooks::camera_orient_end(&jni, entity_renderer, &cam);
         minecraft::swap_render_spoof_rotations(&jni, player, false);
     } else {
+        // Adjust Third Person / Freecam (distance, free look rotation)
+        adjust::hooks::CameraOrientState cam{};
+        adjust::hooks::camera_orient_begin(&jni, entity_renderer, &cam);
         minecraft::entity_renderer_orient_camera(&jni, entity_renderer, partial_ticks);
+        adjust::hooks::camera_orient_end(&jni, entity_renderer, &cam);
     }
 }
 
@@ -480,11 +492,18 @@ void JNICALL hook_update_active_render_info(
 
         minecraft::entity_set_rotation(&jni, local_player, spoof_rot);
         minecraft::entity_set_prev_rotation(&jni, local_player, spoof_rot);
-        minecraft::active_render_info_update(&jni, player, third_person_front != JNI_FALSE);
+        adjust::hooks::CameraRenderInfoState info{};
+        const bool front = adjust::hooks::camera_render_info_begin(&jni, player, third_person_front != JNI_FALSE, &info);
+        minecraft::active_render_info_update(&jni, player, front);
+        adjust::hooks::camera_render_info_end(&jni, player, &info);
         minecraft::entity_set_rotation(&jni, local_player, saved_rot);
         minecraft::entity_set_prev_rotation(&jni, local_player, saved_prev_rot);
     } else {
-        minecraft::active_render_info_update(&jni, player, third_person_front != JNI_FALSE);
+        // Adjust Freecam / free look substitute the rotation used for the render info
+        adjust::hooks::CameraRenderInfoState info{};
+        const bool front = adjust::hooks::camera_render_info_begin(&jni, player, third_person_front != JNI_FALSE, &info);
+        minecraft::active_render_info_update(&jni, player, front);
+        adjust::hooks::camera_render_info_end(&jni, player, &info);
     }
 }
 
@@ -497,11 +516,11 @@ void JNICALL hook_set_render_x(
 {
     (void)cls;
     core::ClientRuntime& rt = core::runtime();
+    events::JniContext jni{rt.mappings, env};
     float view_x = angle_x;
-    if (minecraft::is_rotation_spoof_active()) {
+    if (!adjust::hooks::camera_override_player_view_x(&jni, &view_x) && minecraft::is_rotation_spoof_active()) {
         view_x = minecraft::get_server_spoof_rotation().y;
     }
-    events::JniContext jni{rt.mappings, env};
     minecraft::render_manager_set_player_view_x(&jni, render_manager, view_x);
 }
 
@@ -514,11 +533,11 @@ void JNICALL hook_set_render_y(
 {
     (void)cls;
     core::ClientRuntime& rt = core::runtime();
+    events::JniContext jni{rt.mappings, env};
     float view_y = angle_y;
-    if (minecraft::is_rotation_spoof_active()) {
+    if (!adjust::hooks::camera_override_player_view_y(&jni, &view_y) && minecraft::is_rotation_spoof_active()) {
         view_y = minecraft::get_server_spoof_rotation().x;
     }
-    events::JniContext jni{rt.mappings, env};
     minecraft::render_manager_set_player_view_y(&jni, render_manager, view_y);
 }
 

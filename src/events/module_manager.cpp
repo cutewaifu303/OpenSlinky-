@@ -10,6 +10,11 @@ namespace {
 
 thread_local uint32_t g_sort_event_index = 0;
 
+VisualStyle g_active_style = VisualStyle::SlinkyPlusPlus;
+VisualStyle g_requested_style = VisualStyle::SlinkyPlusPlus;
+
+constexpr uint64_t kAllEventsMask = (1ULL << kEventCount) - 1ULL;
+
 int compare_module_priority(const void* lhs, const void* rhs) noexcept {
     const auto* mod_a = *static_cast<const Module* const*>(lhs);
     const auto* mod_b = *static_cast<const Module* const*>(rhs);
@@ -21,6 +26,25 @@ int compare_module_priority(const void* lhs, const void* rhs) noexcept {
 }
 
 } // namespace
+
+VisualStyle get_active_visual_style() noexcept {
+    return g_active_style;
+}
+
+VisualStyle get_requested_visual_style() noexcept {
+    return g_requested_style;
+}
+
+void request_visual_style(VisualStyle style) noexcept {
+    if (style != VisualStyle::SlinkyPlusPlus && style != VisualStyle::Adjust) {
+        style = VisualStyle::SlinkyPlusPlus;
+    }
+    g_requested_style = style;
+}
+
+bool visual_style_change_pending() noexcept {
+    return g_requested_style != g_active_style;
+}
 
 int ModuleManager::initialize(Module* const* registry, size_t count, SetModuleKeybindFn keybind_cb) noexcept {
     std::memset(&categories, 0, sizeof(ModuleManager) - offsetof(ModuleManager, categories));
@@ -183,7 +207,7 @@ void ModuleManager::rebuild_event_callbacks(uint64_t dirty_event_mask) noexcept 
         Module** mods = subscribers[ev].data;
         for (size_t i = 0; i < total; ++i) {
             Module* m = mods[i];
-            if (m->enabled && m->events[ev].callback != nullptr) {
+            if (m->enabled && m->events[ev].callback != nullptr && module_matches_style(m, g_active_style)) {
                 *out++ = m->events[ev].callback;
             }
         }
@@ -191,7 +215,52 @@ void ModuleManager::rebuild_event_callbacks(uint64_t dirty_event_mask) noexcept 
     }
 }
 
+// Switches the active visual style. Modules that leave the style are told they were disabled while they are
+// still subscribed; modules that join it are told they were enabled once they are subscribed again. The
+// persisted `enabled` flag itself is never touched, so switching back restores everything exactly.
+void ModuleManager::apply_visual_style(GameContext* ctx, OnModuleDisabledCleanupFn on_disabled_cleanup) noexcept {
+    const VisualStyle old_style = g_active_style;
+    const VisualStyle new_style = g_requested_style;
+    if (old_style == new_style) {
+        return;
+    }
+
+    for (size_t i = 0; i < module_count; ++i) {
+        Module* mod = all_modules[i];
+        if (mod->enabled && module_matches_style(mod, old_style) && !module_matches_style(mod, new_style)) {
+            ModuleStateChangedEvent state_ev{};
+            state_ev.id = kEventModuleStateChanged;
+            state_ev.ctx = ctx;
+            state_ev.module = mod;
+            state_ev.enabled = false;
+            dispatch(&state_ev);
+            if (on_disabled_cleanup != nullptr) {
+                on_disabled_cleanup(mod);
+            }
+        }
+    }
+
+    g_active_style = new_style;
+    rebuild_event_callbacks(kAllEventsMask);
+
+    for (size_t i = 0; i < module_count; ++i) {
+        Module* mod = all_modules[i];
+        if (mod->enabled && !module_matches_style(mod, old_style) && module_matches_style(mod, new_style)) {
+            ModuleStateChangedEvent state_ev{};
+            state_ev.id = kEventModuleStateChanged;
+            state_ev.ctx = ctx;
+            state_ev.module = mod;
+            state_ev.enabled = true;
+            dispatch(&state_ev);
+        }
+    }
+}
+
 void ModuleManager::flush_pending_toggles(GameContext* ctx, OnModuleDisabledCleanupFn on_disabled_cleanup) noexcept {
+    if (visual_style_change_pending()) {
+        apply_visual_style(ctx, on_disabled_cleanup);
+    }
+
     if (pending_enable_count > 0) {
         uint64_t dirty_mask = 0;
         for (size_t i = 0; i < pending_enable_count; ++i) {
@@ -206,6 +275,10 @@ void ModuleManager::flush_pending_toggles(GameContext* ctx, OnModuleDisabledClea
         rebuild_event_callbacks(dirty_mask);
 
         for (size_t i = 0; i < pending_enable_count; ++i) {
+            // Modules outside the active style only change their persisted flag, they do not start running.
+            if (!module_matches_style(pending_enable[i], g_active_style)) {
+                continue;
+            }
             ModuleStateChangedEvent state_ev{};
             state_ev.id = kEventModuleStateChanged;
             state_ev.ctx = ctx;
@@ -230,6 +303,9 @@ void ModuleManager::flush_pending_toggles(GameContext* ctx, OnModuleDisabledClea
 
         for (size_t i = 0; i < pending_disable_count; ++i) {
             Module* mod = pending_disable[i];
+            if (!module_matches_style(mod, g_active_style)) {
+                continue; // was not running, nothing to tear down
+            }
             ModuleStateChangedEvent state_ev{};
             state_ev.id = kEventModuleStateChanged;
             state_ev.ctx = ctx;

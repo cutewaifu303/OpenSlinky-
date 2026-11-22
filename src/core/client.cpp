@@ -376,6 +376,10 @@ bool on_trigger_module_keybind(void* target, uint32_t key_code, bool pressed) no
     (void)key_code;
     ClientRuntime& rt = runtime();
     auto* mod = static_cast<events::Module*>(target);
+    // Modules of the other visual style are hidden; their binds do nothing until that style is selected.
+    if (!events::module_matches_style(mod, events::get_active_visual_style())) {
+        return true;
+    }
     if (mod->hold_mode) {
         rt.module_manager.request_set_enabled(mod, pressed);
         mod->hold_active = pressed;

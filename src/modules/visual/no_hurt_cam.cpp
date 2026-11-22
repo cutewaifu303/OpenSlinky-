@@ -12,6 +12,7 @@ events::Module create_module() noexcept {
     mod.name = "No Hurt Cam";
     mod.description = "Removes camera shake when taking damage.";
     mod.category = events::ModuleCategory::Visual;
+    mod.flags |= events::kModuleFlagStyleSlinky; // OpenSlinky++: Slinky++ visual style
     return mod;
 }
 

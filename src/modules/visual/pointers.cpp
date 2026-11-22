@@ -282,6 +282,7 @@ events::Module create_module() noexcept {
     mod.render_settings = &render_settings;
     mod.visit_config = &visit_config;
     mod.format_hud_tag = &format_hud_tag;
+    mod.flags |= events::kModuleFlagStyleSlinky; // OpenSlinky++: Slinky++ visual style
     return mod;
 }
 

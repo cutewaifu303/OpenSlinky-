@@ -34,6 +34,10 @@ enum ModuleFlags : uint32_t {
     kModuleFlagHiddenFromHud    = 1u << 2, // 0x04: Excluded from Mod Overlay active modules list
     kModuleFlagNoHoldMode       = 1u << 3, // 0x08: Keybind is instant/toggle-only (no HOLD pill)
     kModuleFlagGlobalSettings   = 1u << 4, // 0x10: Saved in .slinky/settings instead of per-profile
+    // OpenSlinky++ visual styles: a module tagged with a style only exists (listed + running) while that
+    // style is selected in the ClickGUI. Untagged modules are always available.
+    kModuleFlagStyleSlinky      = 1u << 5, // 0x20: Slinky++ visual (hidden while the Adjust style is active)
+    kModuleFlagStyleAdjust      = 1u << 6, // 0x40: Adjust visual (hidden while the Slinky++ style is active)
 };
 
 struct EventSubscription {
@@ -69,9 +73,19 @@ struct Module {
     VisitModuleConfigFn visit_config = nullptr;        // +0x200 (512)
     FormatModuleHudTagFn format_hud_tag = nullptr;     // +0x208 (520)
     uint64_t reserved_vfunc0 = 0;                      // +0x210 (528)
-    uint64_t reserved_vfunc1 = 0;                      // +0x218 (536)
+    uint64_t reserved_vfunc1 = 0;                      // +0x218 (536) - OpenSlinky++: optional config key (const char*)
 };
 static_assert(sizeof(Module) == 0x220, "Module header must match exact 0x220-byte layout");
+
+// JSON object name used for a module in profiles/settings. Defaults to the display name; modules whose display
+// name collides with another module (e.g. Adjust "Chams" vs Slinky++ "Chams") set a distinct key instead.
+inline const char* module_config_key(const Module* mod) noexcept {
+    return (mod->reserved_vfunc1 != 0) ? reinterpret_cast<const char*>(mod->reserved_vfunc1) : mod->name;
+}
+
+inline void set_module_config_key(Module* mod, const char* key) noexcept {
+    mod->reserved_vfunc1 = reinterpret_cast<uint64_t>(key);
+}
 
 } // namespace events
 } // namespace slinky

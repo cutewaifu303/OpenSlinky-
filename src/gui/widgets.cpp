@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstring>
 #include "config/profile_manager.hpp"
+#include "modules/adjust/hud/tabgui/setting_capture.hpp"
 #include "util/keycodes.hpp"
 
 namespace slinky::gui {
@@ -467,6 +468,11 @@ void render_section_header(
     GuiRenderer* renderer,
     const char* title) noexcept
 {
+    // Adjust Tab GUI setting capture: report the section instead of drawing it.
+    if (modules::adjust_hud::tabgui::capture_active()) {
+        modules::adjust_hud::tabgui::capture_item(modules::adjust_hud::tabgui::CaptureKind::Section, title);
+        return;
+    }
     NVGcontext* vg = renderer->vg;
     math::Vec4f row = gui->next_cell(19.0f);
     row.y += 6.0f;
