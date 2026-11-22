@@ -9,6 +9,7 @@
 #include "minecraft/game_helpers.hpp"
 #include "minecraft/mc_wrappers.hpp"
 #include "modules/module_interop.hpp"
+#include "modules/world/bridge.hpp"
 #include "util/filesystem.hpp"
 #include "util/input_win32.hpp"
 #include "util/keycodes.hpp"
@@ -271,7 +272,9 @@ jboolean JNICALL hook_should_clip_ledge(JNIEnv* env, jclass cls, jobject entity)
     core::ClientRuntime& rt = core::runtime();
     events::JniContext jni{rt.mappings, env};
 
-    if (!modules::get_safe_walk_module()->enabled) {
+    const bool safe_walk_on = modules::get_safe_walk_module()->enabled;
+    const bool bridge_clip = modules::bridge_wants_ledge_clip();
+    if (!safe_walk_on && !bridge_clip) {
         return minecraft::entity_is_sneaking(&jni, entity) ? JNI_TRUE : JNI_FALSE;
     }
 
@@ -281,7 +284,7 @@ jboolean JNICALL hook_should_clip_ledge(JNIEnv* env, jclass cls, jobject entity)
         return minecraft::entity_is_sneaking(&jni, entity) ? JNI_TRUE : JNI_FALSE;
     }
 
-    if (modules::safe_walk_is_edge_sneaking()) {
+    if ((safe_walk_on && modules::safe_walk_is_edge_sneaking()) || bridge_clip) {
         return JNI_TRUE;
     }
     return minecraft::entity_is_sneaking(&jni, entity) ? JNI_TRUE : JNI_FALSE;

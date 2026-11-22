@@ -1,4 +1,5 @@
 #include "util/filesystem.hpp"
+#include "core/branding.hpp"
 #include "util/containers.hpp"
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -248,7 +249,7 @@ void show_error_dialog(const char* fmt, ...) noexcept {
     va_start(args, fmt);
     std::vsnprintf(buf, sizeof(buf), fmt, args);
     va_end(args);
-    MessageBoxA(nullptr, buf, "Slinky", MB_OK | MB_ICONERROR);
+    MessageBoxA(nullptr, buf, branding::kClientName, MB_OK | MB_ICONERROR);
 }
 
 } // namespace slinky::fs

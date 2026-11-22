@@ -11,9 +11,11 @@
 #include "modules/world/auto_tool.hpp"
 #include "modules/combat/auto_weapon.hpp"
 #include "modules/combat/backtrack.hpp"
+#include "modules/world/bed_breaker.hpp"
 #include "modules/utility/blink.hpp"
 #include "modules/visual/block_esp.hpp"
 #include "modules/world/block_in.hpp"
+#include "modules/world/bridge.hpp"
 #include "modules/world/bridge_assist.hpp"
 #include "modules/visual/chams.hpp"
 #include "modules/visual/chest_esp.hpp"
@@ -66,6 +68,7 @@
 #include "modules/combat/timer_range.hpp"
 #include "modules/visual/trajectories.hpp"
 #include "modules/combat/velocity.hpp"
+#include "modules/visual/watermark.hpp"
 #include "modules/combat/weapons.hpp"
 
 namespace slinky::modules {
@@ -83,62 +86,65 @@ events::Module* const* get_module_registry() noexcept {
         get_auto_tool_module(),          // [ 8] Auto Tool
         get_auto_weapon_module(),        // [ 9] Auto Weapon
         get_backtrack_module(),          // [10] Backtrack
-        get_blink_module(),              // [11] Blink
-        get_block_esp_module(),          // [12] Block ESP
-        get_block_in_module(),           // [13] Block In
-        get_bridge_assist_module(),      // [14] Bridge Assist
-        get_chams_module(),              // [15] Chams
-        get_chest_esp_module(),          // [16] Chest ESP
-        get_chest_stealer_module(),      // [17] Chest Stealer
-        get_clutch_module(),             // [18] Clutch
-        get_criticals_module(),          // [19] Criticals
-        get_debug_module(),              // [20] Debug
-        get_fake_lag_module(),           // [21] Fake Lag
-        get_fast_accel_module(),         // [22] Fast Accel
-        get_fast_mine_module(),          // [23] Fast Mine
-        get_fast_place_module(),         // [24] Fast Place
-        get_free_look_module(),          // [25] Free Look
-        get_friends_module(),            // [26] Friends
-        get_ghost_hand_module(),         // [27] Ghost Hand
-        get_gui_module(),                // [28] GUI
-        get_hitboxes_module(),           // [29] Hitboxes
-        get_hit_select_module(),         // [30] Hit Select
-        get_indicators_module(),         // [31] Indicators
-        get_instant_stop_module(),       // [32] Instant Stop
-        get_inv_manager_module(),        // [33] Inv Manager
-        get_inv_walk_module(),           // [34] Inv Walk
-        get_item_esp_module(),           // [35] Item ESP
-        get_item_use_fix_module(),       // [36] Item Use Fix
-        get_keep_sprint_module(),        // [37] Keep Sprint
-        get_knockback_delay_module(),    // [38] Knockback Delay
-        get_knockback_displace_module(), // [39] Knockback Displace
-        get_lag_range_module(),          // [40] Lag Range
-        get_mod_overlay_module(),        // [41] Mod Overlay
-        get_name_tags_module(),          // [42] Name Tags
-        get_no_hit_delay_module(),       // [43] No Hit Delay
-        get_no_hurt_cam_module(),        // [44] No Hurt Cam
-        get_no_item_release_module(),    // [45] No Item Release
-        get_no_jump_delay_module(),      // [46] No Jump Delay
-        get_no_slow_module(),            // [47] No Slow
-        get_notifications_module(),      // [48] Notifications
-        get_no_use_delay_module(),       // [49] No Use Delay
-        get_null_move_module(),          // [50] Null Move
-        get_piercing_module(),           // [51] Piercing
-        get_ping_fix_module(),           // [52] Ping Fix
-        get_player_esp_module(),         // [53] Player ESP
-        get_pointers_module(),           // [54] Pointers
-        get_reach_module(),              // [55] Reach
-        get_refill_module(),             // [56] Refill
-        get_safe_walk_module(),          // [57] Safe Walk
-        get_sprint_module(),             // [58] Sprint
-        get_sprint_reset_module(),       // [59] Sprint Reset
-        get_strafe_module(),             // [60] Strafe
-        get_teams_module(),              // [61] Teams
-        get_timer_module(),              // [62] Timer
-        get_timer_range_module(),        // [63] Timer Range
-        get_trajectories_module(),       // [64] Trajectories
-        get_velocity_module(),           // [65] Velocity
-        get_weapons_module(),            // [66] Weapons
+        get_bed_breaker_module(),        // [11] Bed Breaker
+        get_blink_module(),              // [12] Blink
+        get_block_esp_module(),          // [13] Block ESP
+        get_block_in_module(),           // [14] Block In
+        get_bridge_module(),             // [15] Bridge
+        get_bridge_assist_module(),      // [16] Bridge Assist
+        get_chams_module(),              // [17] Chams
+        get_chest_esp_module(),          // [18] Chest ESP
+        get_chest_stealer_module(),      // [19] Chest Stealer
+        get_clutch_module(),             // [20] Clutch
+        get_criticals_module(),          // [21] Criticals
+        get_debug_module(),              // [22] Debug
+        get_fake_lag_module(),           // [23] Fake Lag
+        get_fast_accel_module(),         // [24] Fast Accel
+        get_fast_mine_module(),          // [25] Fast Mine
+        get_fast_place_module(),         // [26] Fast Place
+        get_free_look_module(),          // [27] Free Look
+        get_friends_module(),            // [28] Friends
+        get_ghost_hand_module(),         // [29] Ghost Hand
+        get_gui_module(),                // [30] GUI
+        get_hitboxes_module(),           // [31] Hitboxes
+        get_hit_select_module(),         // [32] Hit Select
+        get_indicators_module(),         // [33] Indicators
+        get_instant_stop_module(),       // [34] Instant Stop
+        get_inv_manager_module(),        // [35] Inv Manager
+        get_inv_walk_module(),           // [36] Inv Walk
+        get_item_esp_module(),           // [37] Item ESP
+        get_item_use_fix_module(),       // [38] Item Use Fix
+        get_keep_sprint_module(),        // [39] Keep Sprint
+        get_knockback_delay_module(),    // [40] Knockback Delay
+        get_knockback_displace_module(), // [41] Knockback Displace
+        get_lag_range_module(),          // [42] Lag Range
+        get_mod_overlay_module(),        // [43] Mod Overlay
+        get_name_tags_module(),          // [44] Name Tags
+        get_no_hit_delay_module(),       // [45] No Hit Delay
+        get_no_hurt_cam_module(),        // [46] No Hurt Cam
+        get_no_item_release_module(),    // [47] No Item Release
+        get_no_jump_delay_module(),      // [48] No Jump Delay
+        get_no_slow_module(),            // [49] No Slow
+        get_notifications_module(),      // [50] Notifications
+        get_no_use_delay_module(),       // [51] No Use Delay
+        get_null_move_module(),          // [52] Null Move
+        get_piercing_module(),           // [53] Piercing
+        get_ping_fix_module(),           // [54] Ping Fix
+        get_player_esp_module(),         // [55] Player ESP
+        get_pointers_module(),           // [56] Pointers
+        get_reach_module(),              // [57] Reach
+        get_refill_module(),             // [58] Refill
+        get_safe_walk_module(),          // [59] Safe Walk
+        get_sprint_module(),             // [60] Sprint
+        get_sprint_reset_module(),       // [61] Sprint Reset
+        get_strafe_module(),             // [62] Strafe
+        get_teams_module(),              // [63] Teams
+        get_timer_module(),              // [64] Timer
+        get_timer_range_module(),        // [65] Timer Range
+        get_trajectories_module(),       // [66] Trajectories
+        get_velocity_module(),           // [67] Velocity
+        get_watermark_module(),          // [68] Watermark
+        get_weapons_module(),            // [69] Weapons
     };
     return s_registry;
 }

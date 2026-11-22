@@ -182,4 +182,8 @@ events::Module* get_fast_place_module() noexcept {
     return &g_fast_place.base;
 }
 
+float fast_place_get_max_cps() noexcept {
+    return g_fast_place.max_cps.value;
+}
+
 } // namespace slinky::modules

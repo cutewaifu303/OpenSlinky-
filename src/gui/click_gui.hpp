@@ -169,7 +169,7 @@ struct ClickGui {
     // Dismisses any active modal dialog - matches sub_180033EB0 / sub_180037A30
     void close_modal(double current_time) noexcept;
 
-    // Returns true if user confirmed "Unload Slinky?" - matches sub_180033EE0
+    // Returns true if user confirmed "Unload OpenSlinky++?" - matches sub_180033EE0
     bool is_unload_requested() const noexcept { return unload_requested; }
 
     // Processes mouse/keyboard/scroll events when GUI is open - matches sub_180032340

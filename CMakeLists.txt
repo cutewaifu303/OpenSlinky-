@@ -169,7 +169,7 @@ set(SLINKY_MODULE_SOURCES
     src/modules/movement/sprint.cpp
     src/modules/movement/strafe.cpp
 
-    # Visual (15)
+    # Visual (16)
     src/modules/visual/anti_debuff.cpp
     src/modules/visual/block_esp.cpp
     src/modules/visual/chams.cpp
@@ -185,10 +185,13 @@ set(SLINKY_MODULE_SOURCES
     src/modules/visual/player_esp.cpp
     src/modules/visual/pointers.cpp
     src/modules/visual/trajectories.cpp
+    src/modules/visual/watermark.cpp
 
-    # World / Block (7)
+    # World / Block (9)
     src/modules/world/auto_tool.cpp
+    src/modules/world/bed_breaker.cpp
     src/modules/world/block_in.cpp
+    src/modules/world/bridge.cpp
     src/modules/world/bridge_assist.cpp
     src/modules/world/clutch.cpp
     src/modules/world/fast_mine.cpp

@@ -49,7 +49,7 @@ int write_text_file(const WidePath* path, const char* content, bool overwrite) n
 // Frees `path->ptr` and sets to nullptr - matches sub_18006F010
 void free_path(WidePath* path) noexcept;
 
-// Formats a message and displays a modal Win32 error dialog ("Slinky") - matches sub_18006E560
+// Formats a message and displays a modal Win32 error dialog ("OpenSlinky++") - matches sub_18006E560
 void show_error_dialog(const char* fmt, ...) noexcept;
 
 } // namespace slinky::fs

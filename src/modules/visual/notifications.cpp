@@ -6,10 +6,12 @@
 #include <cstring>
 
 #include "config/settings.hpp"
+#include "core/branding.hpp"
 #include "gui/gui_renderer.hpp"
 #include "gui/widgets.hpp"
 #include "modules/module_interop.hpp"
 #include "modules/visual/gui.hpp"
+#include "modules/visual/watermark.hpp"
 #include "nanovg.h"
 #include "util/keycodes.hpp"
 #include "util/math.hpp"
@@ -191,7 +193,13 @@ void on_gui_render_2d(void* raw_event) noexcept {
 
     nvgFontSize(vg, 14.0f);
 
-    float cur_y = 12.0f;
+    // Badge sized to the brand text (the original fixed 70 px only fit "SLINKY").
+    renderer->select_font(gui::kFontRegular);
+    const float badge_w = std::fmax(
+        70.0f, nvgTextBounds(vg, 0.0f, 0.0f, branding::kClientNameUpper, nullptr, nullptr) + 20.0f);
+
+    // Stack toasts below the top-left watermark instead of on top of it.
+    float cur_y = std::fmax(12.0f, watermark_hud_bottom() + 6.0f);
     constexpr float kBaseX = 12.0f;
     for (size_t i = 0; i < s_toast_count; ++i) {
         const ToastEntry& toast = s_toasts[(s_toast_head + i) % kMaxToasts];
@@ -221,7 +229,7 @@ void on_gui_render_2d(void* raw_event) noexcept {
         }
 
         const float text_w = nvgTextBounds(vg, 0.0f, 0.0f, toast.text, nullptr, nullptr);
-        const math::Vec4f outer_rect = math::make_rect(x, cur_y, text_w + 102.0f, 42.0f);
+        const math::Vec4f outer_rect = math::make_rect(x, cur_y, text_w + badge_w + 32.0f, 42.0f);
 
         nvgFillColor(vg, nvgRGBAf(0.078431375f, 0.078431375f, 0.078431375f, 1.0f));
         renderer->fill_rounded_rect(outer_rect, 20.0f);
@@ -229,14 +237,14 @@ void on_gui_render_2d(void* raw_event) noexcept {
         const math::Vec4f badge_rect = math::make_rect(
             outer_rect.x + 8.0f,
             outer_rect.y + 8.0f,
-            70.0f,
+            badge_w,
             outer_rect.h - 16.0f);
 
         nvgFillColor(vg, nvgTransRGBAf(badge_color, 0.15f));
         renderer->fill_rounded_rect(badge_rect, 10.0f);
 
         nvgFillColor(vg, badge_color);
-        renderer->draw_text(badge_rect, gui::kTextAlignCenterMiddle, gui::kFontRegular, "SLINKY");
+        renderer->draw_text(badge_rect, gui::kTextAlignCenterMiddle, gui::kFontRegular, branding::kClientNameUpper);
 
         const math::Vec4f msg_rect = math::make_rect(
             badge_rect.x + badge_rect.w + 8.0f,

@@ -30,7 +30,7 @@ events::Module* get_no_hit_delay_module() noexcept;
 // Initializes the ClickGUI state owned by the GUI module (sub_180033DE0(&unk_180317030))
 void gui_initialize_click_gui() noexcept;
 
-// Returns true if user confirmed "Unload Slinky?" modal in ClickGUI (sub_180053BD0)
+// Returns true if user confirmed "Unload OpenSlinky++?" modal in ClickGUI (sub_180053BD0)
 bool gui_is_unload_confirmed() noexcept;
 
 // Returns current ClickGUI scale multiplier (0.75, 1.0, 1.25, 1.5, 2.0) (sub_180053BF0)

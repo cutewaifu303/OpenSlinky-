@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include "config/profile_manager.hpp"
+#include "core/branding.hpp"
 #include "events/events.hpp"
 #include "util/keycodes.hpp"
 
@@ -241,7 +242,7 @@ void render_tab_bar(ClickGui* gui, GuiRenderer* renderer, float dt) noexcept {
 
         if (gui->consume_click_in(tab_cell)) {
             if (gui->tabs[i].tab_id == 6u) {
-                gui->open_confirm_modal(renderer, gui, on_confirm_unload, "Unload Slinky?");
+                gui->open_confirm_modal(renderer, gui, on_confirm_unload, "Unload " SLINKY_BRAND_NAME "?");
             } else {
                 gui->selected_tab_index = i;
                 gui->focus_mode = GuiFocusMode::None;
