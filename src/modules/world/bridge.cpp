@@ -11,6 +11,7 @@
 #include "gui/widgets.hpp"
 #include "minecraft/game_helpers.hpp"
 #include "minecraft/mc_wrappers.hpp"
+#include "modules/world/bridge_common.hpp"
 #include "modules/world/fast_place.hpp"
 #include "util/math.hpp"
 #include "util/random.hpp"
@@ -29,6 +30,15 @@ constexpr int32_t kFaceEast  = 5;
 
 constexpr double kMaxPlaceReachSq = 20.1601; // 4.49^2
 
+// Bridging technique.
+enum BridgeMode : int32_t {
+    kModeLegitSlinky = 0, // sneak-bridge with the original Slinky Bridge Assist edge sneak
+    kModeLegitVape = 1,   // sneak-bridge with the Vape edge sneak (hold sneak for a delay after each edge)
+    kModeGodBridge = 2,   // same as Legit (Slinky) but never sneaks; the ledge clip keeps you on the edge
+    kModeCount = 3,
+};
+constexpr const char* kModeOptions[kModeCount] = {"Legit (Slinky)", "Legit (Vape)", "GodBridge"};
+
 void on_game_tick(void* event) noexcept;
 void on_module_state_changed(void* event) noexcept;
 void on_rotation_spoof_query(void* event) noexcept;
@@ -43,6 +53,7 @@ struct BridgeState {
     events::Module base{};
 
     // Settings
+    config::ModeSetting mode{{}, "Mode", kModeCount, 0, kModeOptions, 0, 0, false, {}};
     config::FloatSetting edge_offset{{}, "Edge offset", "%.2f blocks", 0.01f, 0.0f, 0.0f, 0.2999f, 0.2f, 0.2f};
     config::BoolSetting show_block_count{{}, "Show block count", true, true, {}};
     config::BoolSetting tower{{}, "Tower (hold jump)", true, true, {}};
@@ -53,11 +64,13 @@ struct BridgeState {
     config::BoolSetting edge_sneak{{}, "Auto sneak at edges", true, true, {}};
     config::BoolSetting sneak_on_jump{{}, "Sneak on jump", false, false, {}};
     config::FloatSetting unsneak_delay{{}, "Unsneak delay", "%.0f ms", 0.1f, 50.0f, 1.0f, 6.0f, 3.0f, 3.0f};
+    config::FloatSetting vape_sneak_delay{{}, "Sneak delay", "%.0f ms", 10.0f, 0.0f, 100.0f, 500.0f, 200.0f, 200.0f};
 
     // Runtime state
     float click_cooldown_ticks = 0.0f;
     bool targeting_active = false;
     bool spoof_rotation_active = false;
+    float vape_sneak_timer = 0.0f;   // ms the Vape edge sneak is still held
     bool sneak_overridden = false;
     float unsneak_timer = 0.0f;
     char hud_text[32]{};      // text shown next to the crosshair (empty = hidden)
@@ -276,10 +289,15 @@ bool find_best_face_for_cell(
 // Picks the support block to click, the face to hit, and a humanized aim point on that face.
 // Target = the air cell under the player (tower: under the feet while rising; bridge: under the
 // current or next-tick centre). Returns false when nothing needs to be placed this tick.
-bool compute_place_target(
+bool find_target_at_level(
     events::GameContext* ctx,
     const math::Vec3d& eye,
     math::Vec2f cur_rot,
+    const math::Vec3d& feet,
+    int32_t support_y,
+    double jx,
+    double jz,
+    bool reject_up_face,
     mc::Vec3i* out_support,
     int32_t* out_side,
     math::Vec3d* out_aim) noexcept
@@ -287,19 +305,6 @@ bool compute_place_target(
     events::JniContext* jni = ctx->jni;
     jobject player = ctx->local_player;
     jobject world = ctx->world;
-
-    math::Vec3d feet = mc::entity_get_position(jni, player);
-    if (mc::is_version_1_7_10(jni)) {
-        feet = math::vec3_sub_eye_height(feet);
-    }
-    const int32_t support_y = static_cast<int32_t>(std::floor(feet.y)) - 1;
-
-    const float rand_scale = g_bridge.randomize.value ? 1.0f : 0.0f;
-    const double jx = static_cast<double>(g_bridge.aim_jitter_a.sample_timed({-0.12f, 0.12f}, 0.5) * rand_scale);
-    const double jz = static_cast<double>(g_bridge.aim_jitter_b.sample_timed({-0.12f, 0.12f}, 0.5) * rand_scale);
-
-    jobject settings = mc::mc_get_game_settings(jni, ctx->minecraft);
-    const bool jump_held = mc::key_binding_is_physically_down(jni, mc::settings_get_key_jump(jni, settings));
 
     // Candidate cells at foot-support level: under the centre, under the next-tick centre, then
     // under every corner of the hitbox. The corners matter when building up while moving: the
@@ -330,7 +335,7 @@ bool compute_place_target(
         }
         PlaceCandidate best{};
         if (find_best_face_for_cell(jni, world, eye, cur_rot, feet, cell, jx, jz, &best)) {
-            if (best.side == kFaceUp && jump_held && !g_bridge.tower.value) {
+            if (best.side == kFaceUp && reject_up_face) {
                 continue;
             }
             *out_support = best.support;
@@ -340,6 +345,40 @@ bool compute_place_target(
         }
     }
     return false;
+}
+
+math::Vec3d feet_of(events::JniContext* jni, jobject player) noexcept {
+    math::Vec3d feet = mc::entity_get_position(jni, player);
+    if (mc::is_version_1_7_10(jni)) {
+        feet = math::vec3_sub_eye_height(feet);
+    }
+    return feet;
+}
+
+void sample_aim_jitter(bool randomize, double* jx, double* jz) noexcept {
+    const float rand_scale = randomize ? 1.0f : 0.0f;
+    *jx = static_cast<double>(g_bridge.aim_jitter_a.sample_timed({-0.12f, 0.12f}, 0.5) * rand_scale);
+    *jz = static_cast<double>(g_bridge.aim_jitter_b.sample_timed({-0.12f, 0.12f}, 0.5) * rand_scale);
+}
+
+bool compute_place_target(
+    events::GameContext* ctx,
+    const math::Vec3d& eye,
+    math::Vec2f cur_rot,
+    mc::Vec3i* out_support,
+    int32_t* out_side,
+    math::Vec3d* out_aim) noexcept
+{
+    events::JniContext* jni = ctx->jni;
+    const math::Vec3d feet = feet_of(jni, ctx->local_player);
+    const int32_t support_y = static_cast<int32_t>(std::floor(feet.y)) - 1;
+    double jx = 0.0;
+    double jz = 0.0;
+    sample_aim_jitter(g_bridge.randomize.value, &jx, &jz);
+    jobject settings = mc::mc_get_game_settings(jni, ctx->minecraft);
+    const bool jump_held = mc::key_binding_is_physically_down(jni, mc::settings_get_key_jump(jni, settings));
+    return find_target_at_level(ctx, eye, cur_rot, feet, support_y, jx, jz,
+                                jump_held && !g_bridge.tower.value, out_support, out_side, out_aim);
 }
 
 math::Vec3d get_feet_pos(events::JniContext* jni, jobject player) noexcept {
@@ -383,8 +422,8 @@ void on_game_tick(void* event) noexcept {
     jobject settings = mc::mc_get_game_settings(jni, ctx->minecraft);
     const bool towering = g_bridge.tower.value &&
                           mc::key_binding_is_physically_down(jni, mc::settings_get_key_jump(jni, settings));
-    if (g_bridge.edge_sneak.value && !towering && mc::entity_is_on_ground(jni, player) &&
-        !mc::entity_is_sneaking(jni, player)) {
+    if (g_bridge.mode.value != kModeGodBridge && g_bridge.edge_sneak.value && !towering &&
+        mc::entity_is_on_ground(jni, player) && !mc::entity_is_sneaking(jni, player)) {
         return;
     }
 
@@ -445,9 +484,30 @@ void on_mid_living_update(void* event) noexcept {
     jobject jump_key = mc::settings_get_key_jump(jni, settings);
     const bool towering = g_bridge.tower.value && mc::key_binding_is_physically_down(jni, jump_key);
 
-    // Never sneak while towering (sneak cancels the jump) or when disabled/out of focus.
-    if (!ctx->in_game_focus || !g_bridge.edge_sneak.value || towering) {
+    // Never sneak while towering (sneak cancels the jump), in GodBridge, or when disabled/out of focus.
+    if (!ctx->in_game_focus || !g_bridge.edge_sneak.value || towering || g_bridge.mode.value == kModeGodBridge) {
         release_override();
+        g_bridge.vape_sneak_timer = 0.0f;
+        return;
+    }
+
+    if (g_bridge.mode.value == kModeLegitVape) {
+        // Vape ScaffoldEdgeSneakHelper: sneak while the next-tick hitbox is over air, then keep holding it
+        // for "Sneak delay" so the block can be placed before standing up.
+        g_bridge.sneak_overridden = true;
+        if (mc::entity_is_on_ground(jni, player) && bridge_common::over_air_edge_vape(jni, ctx->world, player)) {
+            mc::key_binding_set_pressed(jni, sneak_key, true);
+            float delay = g_bridge.vape_sneak_delay.value;
+            if (g_bridge.randomize.value) {
+                delay += random::uniform_range({-40.0f, 40.0f});
+            }
+            g_bridge.vape_sneak_timer = delay;
+        } else if (g_bridge.vape_sneak_timer > 0.0f) {
+            g_bridge.vape_sneak_timer -= 50.0f; // one tick
+            mc::key_binding_set_pressed(jni, sneak_key, true);
+        } else {
+            mc::key_binding_set_pressed(jni, sneak_key, phys_sneak);
+        }
         return;
     }
 
@@ -632,8 +692,12 @@ void on_gui_render_2d(void* event) noexcept {
 
 // Renders Bridge settings in ClickGUI.
 void render_settings(gui::ClickGui* gui, gui::GuiRenderer* renderer) noexcept {
+    const int32_t mode = g_bridge.mode.value;
     gui::widgets::render_section_header(gui, renderer, "Main");
-    g_bridge.edge_offset.render(gui, renderer);
+    g_bridge.mode.render(gui, renderer);
+    if (mode == kModeLegitSlinky) {
+        g_bridge.edge_offset.render(gui, renderer);
+    }
     g_bridge.show_block_count.render(gui, renderer);
     g_bridge.tower.render(gui, renderer);
     g_bridge.randomize.render(gui, renderer);
@@ -642,15 +706,29 @@ void render_settings(gui::ClickGui* gui, gui::GuiRenderer* renderer) noexcept {
     g_bridge.pitch.render(gui, renderer);
     g_bridge.aim_speed.render(gui, renderer);
 
+    if (mode == kModeGodBridge) {
+        gui::widgets::render_section_header(gui, renderer, "GodBridge");
+        g_bridge.safe_edge.render(gui, renderer);
+        return;
+    }
+
     gui::widgets::render_section_header(gui, renderer, "Sneak");
     g_bridge.safe_edge.render(gui, renderer);
     g_bridge.edge_sneak.render(gui, renderer);
-    g_bridge.sneak_on_jump.render(gui, renderer);
-    g_bridge.unsneak_delay.render(gui, renderer);
+    if (mode == kModeLegitSlinky) {
+        g_bridge.sneak_on_jump.render(gui, renderer);
+        g_bridge.unsneak_delay.render(gui, renderer);
+    } else {
+        g_bridge.vape_sneak_delay.render(gui, renderer);
+    }
 }
 
 // Serializes/deserializes Bridge config.
 void visit_config(config::ConfigArchive* archive) noexcept {
+    g_bridge.mode.visit(archive, "mode");
+    if (g_bridge.mode.value < 0 || g_bridge.mode.value >= kModeCount) {
+        g_bridge.mode.value = kModeLegitSlinky;
+    }
     g_bridge.edge_offset.visit(archive, "edge_offset");
     g_bridge.show_block_count.visit(archive, "show_block_count");
     g_bridge.tower.visit(archive, "tower");
@@ -661,12 +739,30 @@ void visit_config(config::ConfigArchive* archive) noexcept {
     g_bridge.edge_sneak.visit(archive, "edge_sneak");
     g_bridge.sneak_on_jump.visit(archive, "sneak_on_jump");
     g_bridge.unsneak_delay.visit(archive, "unsneak_delay");
+    g_bridge.vape_sneak_delay.visit(archive, "vape_sneak_delay");
 }
 
 } // namespace
 
 events::Module* get_bridge_module() noexcept {
     return &g_bridge.base;
+}
+
+bool bridge_find_place_aim(
+    events::GameContext* ctx,
+    const math::Vec3d& eye,
+    math::Vec2f cur_rot,
+    int32_t place_y,
+    bool randomize,
+    math::Vec3d* out_aim) noexcept
+{
+    const math::Vec3d feet = feet_of(ctx->jni, ctx->local_player);
+    double jx = 0.0;
+    double jz = 0.0;
+    sample_aim_jitter(randomize, &jx, &jz);
+    mc::Vec3i support{};
+    int32_t side = 0;
+    return find_target_at_level(ctx, eye, cur_rot, feet, place_y, jx, jz, false, &support, &side, out_aim);
 }
 
 bool bridge_wants_ledge_clip() noexcept {

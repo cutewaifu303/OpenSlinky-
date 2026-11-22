@@ -97,6 +97,7 @@
 #include "modules/adjust/render/freecam/freecam.hpp"
 #include "modules/adjust/render/tweaks/tweaks.hpp"
 #include "modules/adjust/clickgui/adjust_click_gui.hpp"
+#include "modules/altmanager/alt_manager.hpp"
 
 namespace slinky::modules {
 
@@ -199,6 +200,7 @@ events::Module* const* get_module_registry() noexcept {
         get_velocity_module(),                // [94] Velocity
         get_watermark_module(),               // [95] Watermark
         get_weapons_module(),                 // [96] Weapons
+        ::slinky::altmanager::get_alt_manager_module(), // [97] Alt Manager (OpenSlinky++)
     };
     return s_registry;
 }

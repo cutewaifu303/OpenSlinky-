@@ -11,6 +11,7 @@
 #include "core/branding.hpp"
 #include "events/events.hpp"
 #include "events/module_manager.hpp"
+#include "modules/altmanager/settings_popup.hpp"
 #include "util/keycodes.hpp"
 
 namespace slinky::gui {
@@ -1047,53 +1048,17 @@ void ClickGui::show_tooltip(const char* text, float x, float y) noexcept {
     tooltip_pos = math::make_vec2(x, y);
 }
 
-// OpenSlinky++: tiny "Slinky++ | Adjust" visual-style switch in the bottom-right corner (screen space).
+// OpenSlinky++: bottom-right "Settings" button (gear) that opens the style/theme + Alt Manager popup
+// (replaces the old "Slinky++ | Adjust" pill). Drawn in unscrolled screen space.
 void render_visual_style_switch(ClickGui* gui, GuiRenderer* renderer) noexcept {
-    static constexpr const char* kLabels[2] = {"Slinky++", "Adjust"};
-    constexpr float kHeight = 16.0f;
-    constexpr float kMargin = 8.0f;
-    constexpr float kPadX = 6.0f;
-    constexpr float kInset = 2.0f;
-
-    NVGcontext* vg = renderer->vg;
-    nvgFontSize(vg, 11.0f);
-    renderer->select_font(kFontRegular);
-
-    float seg_w[2]{};
-    for (int i = 0; i < 2; ++i) {
-        seg_w[i] = nvgTextBounds(vg, 0.0f, 0.0f, kLabels[i], nullptr, nullptr) + kPadX * 2.0f;
-    }
-    const float total_w = seg_w[0] + seg_w[1] + kInset * 2.0f;
-    const math::Vec4f pill = math::make_rect(
-        renderer->logical_width - kMargin - total_w,
-        renderer->logical_height - kMargin - kHeight,
-        total_w,
-        kHeight);
-
-    nvgFillColor(vg, nvgTransRGBAf(detail::color_card_bg(), 0.9f));
-    renderer->fill_rounded_rect(pill, kHeight * 0.5f);
-
-    const int active = static_cast<int>(events::get_requested_visual_style());
-    float seg_x = pill.x + kInset;
-    for (int i = 0; i < 2; ++i) {
-        const math::Vec4f seg = math::make_rect(seg_x, pill.y + kInset, seg_w[i], kHeight - kInset * 2.0f);
-        // Hit-testing works in scrolled coordinates.
-        math::Vec4f hit = seg;
-        hit.y += gui->scroll_y;
-        const bool hovered = gui->is_hovered(hit);
-        if (gui->consume_click_in(hit) && i != active) {
-            events::request_visual_style(static_cast<events::VisualStyle>(i));
+    const float cursor_x = gui->cursor_fb.x / renderer->scale;
+    const float cursor_y = gui->cursor_fb.y / renderer->scale;
+    altmanager::settings_popup_render(renderer, cursor_x, cursor_y);
+    if (!gui->has_active_modal() && gui->focus_mode == GuiFocusMode::None && gui->mouse_left_down &&
+        !gui->mouse_click_consumed) {
+        if (altmanager::settings_popup_click(cursor_x, cursor_y)) {
+            gui->mouse_click_consumed = true;
         }
-
-        if (i == active) {
-            nvgFillColor(vg, gui->accent_color);
-            renderer->fill_rounded_rect(seg, seg.h * 0.5f);
-            nvgFillColor(vg, detail::color_text_hover());
-        } else {
-            nvgFillColor(vg, hovered ? detail::color_text_muted_hover() : detail::color_text_muted());
-        }
-        renderer->draw_text(seg, kTextAlignCenterMiddle, kFontRegular, kLabels[i]);
-        seg_x += seg_w[i];
     }
 }
 

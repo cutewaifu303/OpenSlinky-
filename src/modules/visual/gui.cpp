@@ -10,6 +10,7 @@
 #include "gui/widgets.hpp"
 #include "minecraft/mc_wrappers.hpp"
 #include "modules/adjust/clickgui/adjust_click_gui.hpp"
+#include "modules/altmanager/alt_manager.hpp"
 #include "modules/module_interop.hpp"
 #include "util/keycodes.hpp"
 #include "util/time.hpp"
@@ -206,6 +207,30 @@ bool gui_handle_window_input(
 {
     events::Module* gui_mod = get_gui_module();
     const bool adjust = events::get_requested_visual_style() == events::VisualStyle::Adjust;
+
+    // Right Shift toggles the Alt Manager: in the main menu (no world) it opens it instead of the ClickGUI, and
+    // anywhere it closes it if open. Guarded by was_already_down so key auto-repeat does not flicker it. When
+    // closed in-game it falls through to the normal ClickGUI toggle below.
+    if (event->kind == input::InputEventKind::KeyOrButton && event->pressed == 1 && !was_already_down &&
+        event->key.key_code == gui_mod->keybind) {
+        if (altmanager::is_open()) {
+            altmanager::close();
+            return true;
+        }
+        if (altmanager::is_in_menu()) {
+            altmanager::open();
+            return true;
+        }
+    }
+
+    // While the Alt Manager is open it sits on top of everything and takes all remaining input first so the
+    // ClickGUI and the game never see it.
+    if (altmanager::is_open()) {
+        if (altmanager::handle_input(event, time::now_seconds())) {
+            return true;
+        }
+    }
+
     if (gui_mod->enabled) {
         const double now = time::now_seconds();
         // The active menu gets the input; the other one only follows the mouse so a style switch is seamless.

@@ -27,6 +27,7 @@
 #include "gui/gui_renderer.hpp"
 #include "modules/adjust/clickgui/adjust_click_gui.hpp"
 #include "modules/adjust/clickgui/internal.hpp"
+#include "modules/altmanager/settings_popup.hpp"
 #include "modules/module_interop.hpp"
 #include "util/filesystem.hpp"
 #include "util/keycodes.hpp"
@@ -1301,87 +1302,29 @@ void Screen::render_screen(Vec2 mouse, const Window& window) {
 
 namespace {
 
-struct StyleSwitch {
-    math::Vec4f segments[2]{}; // logical units of the GUI renderer
-    float renderer_scale = 1.0f;
-    bool valid = false;
-};
+// Renderer scale captured during the last Settings-button draw (used to map cursor pixels to logical coords
+// in the deferred click handler).
+float g_settings_popup_scale = 1.0f;
 
-StyleSwitch& style_switch() {
-    static StyleSwitch s{};
-    return s;
-}
-
-bool rect_hit(const math::Vec4f& r, float px, float py) noexcept {
-    return px >= r.x && py >= r.y && px < r.x + r.w && py < r.y + r.h;
-}
-
+// OpenSlinky++: bottom-right "Settings" button (gear) that opens the style/theme + Alt Manager popup
+// (replaces the old "Slinky++ | Adjust" pill). Shared with the Slinky++ ClickGUI via settings_popup.
 void render_visual_style_switch(gui::GuiRenderer* renderer, float alpha) {
-    static constexpr const char* kLabels[2] = {"Slinky++", "Adjust"};
-    constexpr float kHeight = 16.0f;
-    constexpr float kMargin = 8.0f;
-    constexpr float kPadX = 6.0f;
-    constexpr float kInset = 2.0f;
-
     NVGcontext* vg = renderer->vg;
-    StyleSwitch& sw = style_switch();
     nvgSave(vg);
     nvgGlobalAlpha(vg, alpha);
-    nvgFontSize(vg, 11.0f);
-    renderer->select_font(gui::kFontRegular);
-
-    float seg_w[2]{};
-    for (int i = 0; i < 2; ++i) {
-        seg_w[i] = nvgTextBounds(vg, 0.0f, 0.0f, kLabels[i], nullptr, nullptr) + kPadX * 2.0f;
-    }
-    const float total_w = seg_w[0] + seg_w[1] + kInset * 2.0f;
-    const math::Vec4f pill = math::make_rect(renderer->logical_width - kMargin - total_w,
-                                             renderer->logical_height - kMargin - kHeight, total_w, kHeight);
-    nvgFillColor(vg, nvgTransRGBAf(gui::detail::color_card_bg(), 0.9f));
-    renderer->fill_rounded_rect(pill, kHeight * 0.5f);
-
-    const math::Color3f accent3 = gui_get_accent_color();
-    const NVGcolor accent = nvgRGBf(accent3.r, accent3.g, accent3.b);
-    const int active = static_cast<int>(events::get_requested_visual_style());
-    const float cx = env().cursor_px.x / renderer->scale;
-    const float cy = env().cursor_px.y / renderer->scale;
-    float seg_x = pill.x + kInset;
-    for (int i = 0; i < 2; ++i) {
-        const math::Vec4f seg = math::make_rect(seg_x, pill.y + kInset, seg_w[i], kHeight - kInset * 2.0f);
-        sw.segments[i] = seg;
-        const bool hovered = rect_hit(seg, cx, cy);
-        if (i == active) {
-            nvgFillColor(vg, accent);
-            renderer->fill_rounded_rect(seg, seg.h * 0.5f);
-            nvgFillColor(vg, gui::detail::color_text_hover());
-        } else {
-            nvgFillColor(vg, hovered ? gui::detail::color_text_muted_hover() : gui::detail::color_text_muted());
-        }
-        renderer->draw_text(seg, gui::kTextAlignCenterMiddle, gui::kFontRegular, kLabels[i]);
-        seg_x += seg_w[i];
-    }
-    sw.renderer_scale = renderer->scale;
-    sw.valid = true;
+    g_settings_popup_scale = (renderer->scale > 0.0f) ? renderer->scale : 1.0f;
+    const float cx = env().cursor_px.x / g_settings_popup_scale;
+    const float cy = env().cursor_px.y / g_settings_popup_scale;
+    altmanager::settings_popup_render(renderer, cx, cy);
     nvgRestore(vg);
 }
 
-// Left press on the switch: true if it hit a segment.
+// Left press on the Settings button / popup: true if it consumed the click.
 bool style_switch_click() {
-    StyleSwitch& sw = style_switch();
-    if (!sw.valid || sw.renderer_scale <= 0.0f) {
-        return false;
-    }
-    const float cx = env().cursor_px.x / sw.renderer_scale;
-    const float cy = env().cursor_px.y / sw.renderer_scale;
-    for (int i = 0; i < 2; ++i) {
-        if (rect_hit(sw.segments[i], cx, cy)) {
-            if (i != static_cast<int>(events::get_requested_visual_style())) {
-                events::request_visual_style(static_cast<events::VisualStyle>(i));
-            }
-            return true;
-        }
-    }
-    return false;
+    const float scale = (g_settings_popup_scale > 0.0f) ? g_settings_popup_scale : 1.0f;
+    const float cx = env().cursor_px.x / scale;
+    const float cy = env().cursor_px.y / scale;
+    return altmanager::settings_popup_click(cx, cy);
 }
 
 int decode_char(const char* utf8) noexcept {
@@ -1412,7 +1355,6 @@ void on_open(double now) noexcept {
 void on_close() noexcept {
     try {
         screen().on_close();
-        style_switch().valid = false;
     } catch (...) {
     }
 }

@@ -253,6 +253,13 @@ set(SLINKY_MODULE_SOURCES
     src/modules/utility/refill.cpp
     src/modules/utility/teams.cpp
     src/modules/utility/timer.cpp
+
+    # OpenSlinky++ Alt Manager (account switcher + Microsoft/session/cookie login + live session injection).
+    src/modules/altmanager/account_store.cpp
+    src/modules/altmanager/msa_auth.cpp
+    src/modules/altmanager/session_inject.cpp
+    src/modules/altmanager/alt_manager.cpp
+    src/modules/altmanager/settings_popup.cpp
 )
 
 # OpenSlinky++ Adjust visual style: render kit (src/adjust) + ported Adjust visual modules (src/modules/adjust).
@@ -293,6 +300,8 @@ target_link_libraries(slinky PRIVATE
     user32
     shell32
     winhttp
+    crypt32   # DPAPI (CryptProtectData) for the Alt Manager account store
+    ws2_32    # WinSock loopback listener for the Microsoft OAuth redirect
 )
 
 if(MINGW)
@@ -302,6 +311,30 @@ if(MINGW)
         -static-libstdc++
         -Wl,-Bstatic,--whole-archive -lwinpthread -Wl,--no-whole-archive,-Bdynamic
     )
+endif()
+
+# ============================================================================
+# 3b. Injector (`slinky_injector.exe`) - small Win32 UI that LoadLibrary-injects
+#     libslinky.dll into a running Minecraft (java/javaw) process.
+# ============================================================================
+enable_language(RC)
+add_executable(slinky_injector WIN32
+    tools/injector/injector.cpp
+    tools/injector/injector.rc
+)
+
+target_compile_definitions(slinky_injector PRIVATE
+    UNICODE
+    _UNICODE
+    WIN32_LEAN_AND_MEAN
+    NOMINMAX
+)
+
+target_link_libraries(slinky_injector PRIVATE comctl32 comdlg32 user32 gdi32 kernel32)
+
+if(MINGW)
+    target_compile_options(slinky_injector PRIVATE -Wall -Wextra)
+    target_link_options(slinky_injector PRIVATE -municode -static)
 endif()
 
 # ============================================================================
