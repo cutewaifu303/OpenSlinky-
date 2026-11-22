@@ -6,6 +6,7 @@
 #include <atomic>
 #include <cstdint>
 
+#include "bytecode/jvmti_installer.hpp"
 #include "core/client.hpp"
 #include "modules/module_interop.hpp"
 #include "util/filesystem.hpp"
@@ -23,7 +24,14 @@ DWORD WINAPI client_init_worker(LPVOID param) noexcept {
     auto hmod = static_cast<HMODULE>(param);
     const int err = slinky::core::initialize_client(hmod);
     if (err != 0) {
-        slinky::fs::show_error_dialog("Initialization failed: %u", static_cast<unsigned int>(err));
+        if (err == slinky::bytecode::kErrStaleHooksClass) {
+            slinky::fs::show_error_dialog(
+                "Initialization failed: %u\n\nAn older OpenSlinky++ build was already injected into this game "
+                "session. Restart Minecraft, then inject again.",
+                static_cast<unsigned int>(err));
+        } else {
+            slinky::fs::show_error_dialog("Initialization failed: %u", static_cast<unsigned int>(err));
+        }
         FreeLibraryAndExitThread(hmod, static_cast<DWORD>(err));
     }
     return 0;

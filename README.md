@@ -25,7 +25,7 @@ OpenSlinky++ only rebrands what you can see. Everything that is stored or used f
 - **Same storage folder:** `%USERPROFILE%\.slinky\` (`profiles\` and the global `settings` file).
 - **Same config format:** profiles and settings created with Slinky or openslinky load as-is. Modules that did not exist there (Bed Breaker, Bridge, Watermark) simply start with their defaults.
 - **Same DLL and entry point:** the output is still `libslinky.dll` with the `slinky_init` export, so existing injectors and loaders keep working.
-- **Same internal identifiers:** the injected Java classes (`SlinkyHooks13`, `SlinkyChannelHandler`) and the `slinky_handler` Netty pipeline name are never shown in game and stay as they are.
+- **Same internal identifiers:** the injected Java class `SlinkyChannelHandler` and the `slinky_handler` Netty pipeline name are never shown in game and stay as they are. The hook class is named `SlinkyHooks13_<hash>` (derived from `java/src/SlinkyHooks13.java`), so a new build can be injected after unloading an older one without restarting the game.
 
 ---
 

@@ -17,6 +17,9 @@ namespace slinky::bytecode {
 enum HookInstallerError : int {
     kInstallOk                  = 0,
     kErrRegisterNativesFailed   = 2001,
+    // OpenSlinky++: SlinkyHooks13 already exists in this JVM from an older build (injected earlier in the same
+    // game session) and lacks natives this build needs. Classes cannot be unloaded, so the game must be restarted.
+    kErrStaleHooksClass         = 2101,
     kErrGetJvmtiEnvFailed       = 2004,
     kErrDefineClassFailed       = 2006,
 };
